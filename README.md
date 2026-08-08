@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/app_icon.png" alt="eR Commander logo" width="200">
+  <img src="app_icon.png" alt="eR Commander logo" width="200">
 </p>
 <p align="center">
   <a href="https://www.paypal.com/paypalme/DaTTcz">
