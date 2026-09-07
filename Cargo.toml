@@ -1,0 +1,32 @@
+[package]
+name = "er-commander"
+version = "0.1.0"
+edition = "2021"
+authors = ["David Trubka"]
+description = "Dvoupanelový správce souborů pro Windows a Linux postavený v Rustu (egui)"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/DaTTcz/eR-Commander"
+
+[[bin]]
+name = "eR_Commander"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "unwind"
+
+[dependencies]
+eframe = "0.28"
+egui_extras = { version = "0.28", features = ["image"] }
+notify = "6"
+regex = "1"
+serde_json = "1"
+walkdir = "2"
+chrono = "0.4"
+rayon = "1"
+zip = "0.6"
+sha2 = "0.10"
+md5 = { package = "md-5", version = "0.10" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
