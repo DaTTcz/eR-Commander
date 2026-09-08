@@ -3501,7 +3501,7 @@ impl FileManagerApp {
                     ui.label("krok:");
                     ui.add(egui::DragValue::new(&mut self.rename_counter_step).speed(1));
                     ui.label("šířka:");
-                    ui.add(egui::DragValue::new(&mut self.rename_counter_width).clamp_range(1..=8));
+                    ui.add(egui::DragValue::new(&mut self.rename_counter_width).range(1..=8));
                 });
 
                 ui.separator();
@@ -5295,8 +5295,8 @@ fn render_panel(
                         let ghost = if sel == 1 { format!("➡ {}", entry.name) }
                                     else { format!("➡ {} souborů", sel) };
                         let mouse_pos = ui.input(|inp| inp.pointer.hover_pos().unwrap_or_default());
-                        egui::show_tooltip_at(ui.ctx(), egui::Id::new("drag_tooltip"),
-                            Some(mouse_pos + egui::vec2(12.0, 8.0)), |ui| {
+                        egui::show_tooltip_at(ui.ctx(), ui.layer_id(), egui::Id::new("drag_tooltip"),
+                            mouse_pos + egui::vec2(12.0, 8.0), |ui| {
                                 ui.label(egui::RichText::new(&ghost)
                                     .color(egui::Color32::from_rgb(255, 210, 80)));
                             });
