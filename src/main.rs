@@ -5695,13 +5695,16 @@ fn main() -> eframe::Result<()> {
 
             #[cfg(target_os = "linux")]
             {
-                // Na Linuxu není pevná cesta k emoji fontu jako na
-                // Windows (liší se dle distribuce) - zeptáme se
-                // fontconfigu (fc-match), stejně jako to dělá zbytek
-                // desktopu (GTK/Qt aplikace).
-                let fc_match_path = |family: &str| -> Option<String> {
+                // Fontconfig umí dohledat font, který pokrývá konkrétní
+                // Unicode znak, přes dotaz ":charset=<hex kód>" - to je
+                // mnohem spolehlivější než hádat název rodiny fontů
+                // ("emoji", "sans-serif"), protože se liší distribuci od
+                // distribuce a např. Noto navíc dělí symboly (▲▼★ apod.)
+                // do samostatných "Symbols" fontů mimo běžný sans-serif.
+                let fc_match_for_char = |ch: char| -> Option<String> {
+                    let pattern = format!(":charset={:x}", ch as u32);
                     std::process::Command::new("fc-match")
-                        .args(["-f", "%{file}", family])
+                        .args(["-f", "%{file}", &pattern])
                         .output()
                         .ok()
                         .filter(|o| o.status.success())
@@ -5709,55 +5712,34 @@ fn main() -> eframe::Result<()> {
                         .filter(|s| !s.is_empty())
                 };
 
-                // Několik obvyklých pevných cest jako záložní řešení
-                // pro případ, že by fontconfig chyběl nebo vrátil
-                // font bez emoji podpory.
-                let emoji_candidates: Vec<String> = fc_match_path("emoji")
-                    .into_iter()
-                    .chain([
-                        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-                        "/usr/share/fonts/google-noto-color-emoji-fonts/NotoColorEmoji.ttf",
-                        "/usr/share/fonts/google-noto-emoji-fonts/NotoColorEmoji.ttf",
-                        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-                        "/usr/share/fonts/noto-color-emoji-fonts/NotoColorEmoji.ttf",
-                    ].iter().map(|s| s.to_string()))
-                    .collect();
+                // Znaky, které aplikace používá jako ikonky mimo běžný
+                // text (viz Icons::* a řadicí šipky ▲▼).
+                let probe_chars = [
+                    '\u{1F4C1}', '\u{1F4C4}', '\u{1F4E6}', // 📁 📄 📦
+                    '\u{2B06}', '\u{2605}',                 // ⬆ ★
+                    '\u{25B2}', '\u{25BC}',                 // ▲ ▼
+                ];
 
-                let mut fallback_names: Vec<String> = Vec::new();
-
-                for path in &emoji_candidates {
-                    if let Ok(font_data) = std::fs::read(path) {
-                        let name = "linux_emoji".to_string();
-                        fonts.font_data.insert(name.clone(), egui::FontData::from_owned(font_data));
-                        fallback_names.push(name);
-                        break;
-                    }
-                }
-
-                // Základní systémový font (DejaVu Sans / Noto Sans /
-                // Liberation Sans...) pokrývá geometrické tvary a
-                // symboly (▲▼★⬆), i kdyby barevný emoji font výše
-                // chyběl nebo se nenašel.
-                if let Some(path) = fc_match_path("sans-serif") {
+                let mut seen_paths: HashSet<String> = HashSet::new();
+                let mut idx: u32 = 0;
+                for ch in probe_chars {
+                    let Some(path) = fc_match_for_char(ch) else { continue };
+                    if !seen_paths.insert(path.clone()) { continue; }
                     if let Ok(font_data) = std::fs::read(&path) {
-                        let name = "linux_sans_fallback".to_string();
+                        let name = format!("linux_fallback_{idx}");
+                        idx += 1;
                         fonts.font_data.insert(name.clone(), egui::FontData::from_owned(font_data));
-                        fallback_names.push(name);
+                        fonts.families
+                            .get_mut(&egui::FontFamily::Proportional)
+                            .unwrap()
+                            .push(name.clone());
+                        fonts.families
+                            .get_mut(&egui::FontFamily::Monospace)
+                            .unwrap()
+                            .push(name);
                     }
-                }
-
-                for name in fallback_names {
-                    fonts.families
-                        .get_mut(&egui::FontFamily::Proportional)
-                        .unwrap()
-                        .push(name.clone());
-                    fonts.families
-                        .get_mut(&egui::FontFamily::Monospace)
-                        .unwrap()
-                        .push(name);
                 }
             }
-
             cc.egui_ctx.set_fonts(fonts);
 
             // Vypneme selectable_labels aby widgety nebraly focus kliknutím
