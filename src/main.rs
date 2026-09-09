@@ -1435,11 +1435,24 @@ struct Icons;
 
 impl Icons {
     // Emoji ikonky - fungují díky Segoe UI Emoji fontu načtenému v main()
-    fn folder()   -> &'static str { "\u{1F4C1}" }  // 📁
-    fn file()     -> &'static str { "\u{1F4C4}" }  // 📄
-    fn archive()  -> &'static str { "\u{1F4E6}" }  // 📦
+    fn folder()   -> &'static str { "\u{1F4C1}" }  // 📁 (dnes nepoužito - viz RowIcon)
+    fn file()     -> &'static str { "\u{1F4C4}" }  // 📄 (dnes nepoužito - viz RowIcon)
+    fn archive()  -> &'static str { "\u{1F4E6}" }  // 📦 (dnes nepoužito - viz RowIcon)
     fn up()       -> &'static str { "\u{2B06}"  }  // ⬆
     fn bookmark() -> &'static str { "\u{2605}"  }  // ★
+}
+
+/// Ikonka řádku ve výpisu souborů/složek. Složka/soubor/archiv se
+/// kreslí jako skutečný barevný PNG obrázek (emoji fonty na Linuxu
+/// zvládne egui vykreslit jen jednobarevně, viz diskuze), zatímco
+/// ostatní (např. šipka ".." pro nadřazenou složku) zůstávají jako
+/// textový Unicode znak.
+#[derive(Clone, Copy)]
+enum RowIcon {
+    Text(&'static str),
+    Folder,
+    File,
+    Archive,
 }
 
 #[derive(Clone, PartialEq)]
@@ -5352,7 +5365,29 @@ fn render_panel(
 
                         let row_resp = ui.horizontal(|ui| {
                             // ikonka
-                            ui.add_sized([ICO_W, H], egui::Label::new($icon));
+                            match $icon {
+                                RowIcon::Text(t) => {
+                                    ui.add_sized([ICO_W, H], egui::Label::new(t));
+                                }
+                                RowIcon::Folder => {
+                                    ui.add_sized([ICO_W, H], egui::Image::from_bytes(
+                                        "bytes://folder_icon.png",
+                                        include_bytes!("../assets/folder_icon.png").as_slice(),
+                                    ).fit_to_exact_size(egui::vec2(ICO_W, H)));
+                                }
+                                RowIcon::File => {
+                                    ui.add_sized([ICO_W, H], egui::Image::from_bytes(
+                                        "bytes://file_icon.png",
+                                        include_bytes!("../assets/file_icon.png").as_slice(),
+                                    ).fit_to_exact_size(egui::vec2(ICO_W, H)));
+                                }
+                                RowIcon::Archive => {
+                                    ui.add_sized([ICO_W, H], egui::Image::from_bytes(
+                                        "bytes://archive_icon.png",
+                                        include_bytes!("../assets/archive_icon.png").as_slice(),
+                                    ).fit_to_exact_size(egui::vec2(ICO_W, H)));
+                                }
+                            }
                             // název doleva + ořez
                             cell_left(ui,  name_w, $stem,           $sel, $cur);
                             // přípona doleva
@@ -5390,7 +5425,7 @@ fn render_panel(
                 if up_offset == 1 {
                     let is_cur = is_active && panel.cursor == 0;
                     let (cl, _, _, _, _) = file_row!(
-                        0usize, Icons::up(), "..", "", String::new(),
+                        0usize, RowIcon::Text(Icons::up()), "..", "", String::new(),
                         "", "", false, is_cur
                     );
                     if cl { go_up = true; }
@@ -5400,9 +5435,9 @@ fn render_panel(
                     let idx  = i + up_offset;
                     let sel  = panel.selected.contains(&i);
                     let cur  = is_active && idx == panel.cursor;
-                    let ico  = if entry.is_dir { Icons::folder() }
-                               else if entry.is_archive { Icons::archive() }
-                               else { Icons::file() };
+                    let ico  = if entry.is_dir { RowIcon::Folder }
+                               else if entry.is_archive { RowIcon::Archive }
+                               else { RowIcon::File };
 
                     let stem = if !entry.is_dir && !entry.ext.is_empty() {
                         entry.name.strip_suffix(&format!(".{}", entry.ext))
