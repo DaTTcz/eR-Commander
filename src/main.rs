@@ -3932,35 +3932,48 @@ impl FileManagerApp {
                             }
                             #[cfg(target_os = "linux")]
                             {
-                                // Zkusíme zenity (GTK/GNOME), pak kdialog (KDE) jako fallback
-                                let zenity = std::process::Command::new("zenity")
+                                // Zkusíme zenity (GTK/GNOME); pokud vůbec
+                                // není nainstalované, zkusíme kdialog
+                                // (KDE) jako fallback. Pokud uživatel
+                                // dialog jen zavře/zruší, druhý nástroj
+                                // už nezkoušíme (to by otevřelo druhé
+                                // okno navíc).
+                                let zenity_result = std::process::Command::new("zenity")
                                     .args(["--file-selection", "--title=Vybrat editor"])
                                     .output();
-                                let picked = match zenity {
+
+                                match zenity_result {
                                     Ok(out) if out.status.success() => {
-                                        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-                                    }
-                                    _ => {
-                                        let kdialog = std::process::Command::new("kdialog")
-                                            .args(["--getopenfilename", ".", "*", "--title", "Vybrat editor"])
-                                            .output();
-                                        match kdialog {
-                                            Ok(out) if out.status.success() => {
-                                                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-                                            }
-                                            _ => None,
+                                        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                        if !path.is_empty() {
+                                            self.external_editor = path;
+                                            changed = true;
                                         }
                                     }
-                                };
-                                match picked {
-                                    Some(path) if !path.is_empty() => {
-                                        self.external_editor = path;
-                                        changed = true;
+                                    Ok(_) => {
+                                        // zenity proběhlo, uživatel zrušil výběr - hotovo
                                     }
-                                    Some(_) => {}
-                                    None => {
-                                        self.op_status = Some(StatusMsg::Error(
-                                            "Nepodařilo se otevřít dialog pro výběr souboru (chybí zenity nebo kdialog).".to_string()));
+                                    Err(_) => {
+                                        // zenity chybí - zkusíme kdialog
+                                        let kdialog_result = std::process::Command::new("kdialog")
+                                            .args(["--getopenfilename", ".", "*", "--title", "Vybrat editor"])
+                                            .output();
+                                        match kdialog_result {
+                                            Ok(out) if out.status.success() => {
+                                                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                                if !path.is_empty() {
+                                                    self.external_editor = path;
+                                                    changed = true;
+                                                }
+                                            }
+                                            Ok(_) => {
+                                                // kdialog proběhlo, uživatel zrušil výběr - hotovo
+                                            }
+                                            Err(_) => {
+                                                self.op_status = Some(StatusMsg::Error(
+                                                    "Nepodařilo se otevřít dialog pro výběr souboru (chybí zenity i kdialog).".to_string()));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -5582,13 +5595,29 @@ fn ensure_linux_desktop_entry() {
         let _ = f.write_all(include_bytes!("../assets/app_icon.png"));
     }
 
-    let desktop_path = apps_dir.join("er-commander.desktop");
+    // Název .desktop souboru MUSÍ přesně (case-sensitive) odpovídat
+    // app_id nastavenému přes with_app_id("eR_Commander") ve fn main().
+    // Na Waylandu (KWin i ostatní kompozitoři) se totiž ikonka okna
+    // (dekorace/titulek) dohledává primárně podle "desktop file ID"
+    // (= název souboru bez přípony .desktop) rovnajícího se app_id -
+    // StartupWMClass je jen X11/GTK fallback, který na Waylandu pro
+    // dekoraci okna nestačí (proto fungovala ikonka v panelu úloh,
+    // ale ne v titulku okna).
+    let desktop_path = apps_dir.join("eR_Commander.desktop");
     let content = format!(
         "[Desktop Entry]\nType=Application\nName=eR Commander\nComment=Dvoupanelový správce souborů\nExec=\"{}\"\nIcon=er-commander\nCategories=Utility;FileManager;System;\nTerminal=false\nStartupNotify=true\nStartupWMClass=eR_Commander\n",
         exe_path.display()
     );
     if fs::write(&desktop_path, content).is_err() {
         return;
+    }
+
+    // Úklid staršího (špatně pojmenovaného) .desktop souboru z
+    // předchozích verzí, ať v menu nezůstane duplicitní/nefunkční
+    // záznam vedle toho nového.
+    let old_desktop_path = apps_dir.join("er-commander.desktop");
+    if old_desktop_path != desktop_path {
+        let _ = fs::remove_file(&old_desktop_path);
     }
 
     #[cfg(unix)]
