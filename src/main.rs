@@ -1580,6 +1580,7 @@ struct FileManagerApp {
     update_state: UpdateState,
     show_update_dialog: bool,
     maximize_on_start: bool,
+    icon_set_on_start: bool,
     update_auto_checked: bool, // automatická kontrola proběhla při startu
 
     pending_action: Option<PendingAction>,
@@ -1762,6 +1763,7 @@ impl Default for FileManagerApp {
             update_state: UpdateState::Idle,
             show_update_dialog: false,
             maximize_on_start: false,
+            icon_set_on_start: false,
             update_auto_checked: false,
             pending_action: None,
             pending_conflicts: Vec::new(),
@@ -2802,6 +2804,21 @@ impl eframe::App for FileManagerApp {
         if self.maximize_on_start {
             self.maximize_on_start = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+
+        // Ikonka okna (titulek/lišta) v prvním framu - stejně jako
+        // maximalizace, with_icon v ViewportBuilder se na některých
+        // Linux WM správcích oken nepromítne do dekorace okna
+        // spolehlivě, ViewportCommand je spolehlivější.
+        if !self.icon_set_on_start {
+            self.icon_set_on_start = true;
+            if let Ok(icon) = eframe::icon_data::from_png_bytes(
+                include_bytes!("../assets/app_icon.png")
+            ) {
+                ctx.send_viewport_cmd(
+                    egui::ViewportCommand::Icon(Some(std::sync::Arc::new(icon)))
+                );
+            }
         }
 
         // Automatická kontrola aktualizací - jednou při startu, tiše na pozadí
@@ -3895,19 +3912,56 @@ impl FileManagerApp {
                             .desired_width(280.0)
                             .hint_text("např. C:\\Program Files\\Notepad++\\notepad++.exe"));
                         if ui.button("📂").on_hover_text("Vybrat exe soubor").clicked() {
-                            let result = std::process::Command::new("powershell")
-                                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command",
-                                    "Add-Type -AssemblyName System.Windows.Forms; \
-                                     $f = New-Object System.Windows.Forms.OpenFileDialog; \
-                                     $f.Filter = 'Spustitelne soubory (*.exe)|*.exe|Vsechny soubory (*.*)|*.*'; \
-                                     $f.Title = 'Vybrat editor'; \
-                                     if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"])
-                                .output();
-                            if let Ok(out) = result {
-                                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                                if !path.is_empty() {
-                                    self.external_editor = path;
-                                    changed = true;
+                            #[cfg(windows)]
+                            {
+                                let result = std::process::Command::new("powershell")
+                                    .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command",
+                                        "Add-Type -AssemblyName System.Windows.Forms; \
+                                         $f = New-Object System.Windows.Forms.OpenFileDialog; \
+                                         $f.Filter = 'Spustitelne soubory (*.exe)|*.exe|Vsechny soubory (*.*)|*.*'; \
+                                         $f.Title = 'Vybrat editor'; \
+                                         if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"])
+                                    .output();
+                                if let Ok(out) = result {
+                                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                    if !path.is_empty() {
+                                        self.external_editor = path;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                // Zkusíme zenity (GTK/GNOME), pak kdialog (KDE) jako fallback
+                                let zenity = std::process::Command::new("zenity")
+                                    .args(["--file-selection", "--title=Vybrat editor"])
+                                    .output();
+                                let picked = match zenity {
+                                    Ok(out) if out.status.success() => {
+                                        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                                    }
+                                    _ => {
+                                        let kdialog = std::process::Command::new("kdialog")
+                                            .args(["--getopenfilename", ".", "*", "--title", "Vybrat editor"])
+                                            .output();
+                                        match kdialog {
+                                            Ok(out) if out.status.success() => {
+                                                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                };
+                                match picked {
+                                    Some(path) if !path.is_empty() => {
+                                        self.external_editor = path;
+                                        changed = true;
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        self.op_status = Some(StatusMsg::Error(
+                                            "Nepodařilo se otevřít dialog pro výběr souboru (chybí zenity nebo kdialog).".to_string()));
+                                    }
                                 }
                             }
                         }
