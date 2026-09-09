@@ -5415,7 +5415,61 @@ fn load_window_state() -> Option<(i32, i32, i32, i32, bool)> {
     Some((x, y, if has_size { w } else { 1300 }, if has_size { h } else { 700 }, maximized))
 }
 
+/// Na Linuxu appka nemá instalátor - je to jeden přenosný soubor. Aby se
+/// ale i tak objevila v menu aplikací (Nástroje/Systém apod.), zapíše si
+/// při každém spuštění vlastní .desktop záznam a ikonu do standardních
+/// XDG umístění pod $HOME. Ukazuje vždy na AKTUÁLNÍ cestu binárky (podle
+/// `current_exe()`), takže i po přesunutí souboru se zástupce při dalším
+/// spuštění sám opraví. Vše je best-effort - chyby (např. bez domovského
+/// adresáře) se tiše ignorují, appka kvůli tomu nesmí spadnout.
+#[cfg(target_os = "linux")]
+fn ensure_linux_desktop_entry() {
+    use std::io::Write;
+
+    let Ok(exe_path) = std::env::current_exe() else { return };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+
+    let icon_dir = home.join(".local/share/icons/hicolor/256x256/apps");
+    let apps_dir = home.join(".local/share/applications");
+    if fs::create_dir_all(&icon_dir).is_err() || fs::create_dir_all(&apps_dir).is_err() {
+        return;
+    }
+
+    let icon_path = icon_dir.join("er-commander.png");
+    if let Ok(mut f) = File::create(&icon_path) {
+        let _ = f.write_all(include_bytes!("../assets/app_icon.png"));
+    }
+
+    let desktop_path = apps_dir.join("er-commander.desktop");
+    let content = format!(
+        "[Desktop Entry]\nType=Application\nName=eR Commander\nComment=Dvoupanelový správce souborů\nExec=\"{}\"\nIcon=er-commander\nCategories=Utility;FileManager;System;\nTerminal=false\nStartupNotify=true\n",
+        exe_path.display()
+    );
+    if fs::write(&desktop_path, content).is_err() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(&desktop_path) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o755);
+            let _ = fs::set_permissions(&desktop_path, perm);
+        }
+    }
+
+    // Ať se menu (GNOME/KDE/XFCE...) obnoví hned, pokud nástroj existuje.
+    // Když chybí, jednoduše se přeskočí - většina prostředí si všimne i tak.
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .status();
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "linux")]
+    ensure_linux_desktop_entry();
+
     let win = load_window_state().unwrap_or((100, 100, 1300, 700, false));
     let (win_x, win_y, win_w, win_h, win_max) = win;
 
