@@ -5442,7 +5442,7 @@ fn ensure_linux_desktop_entry() {
 
     let desktop_path = apps_dir.join("er-commander.desktop");
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=eR Commander\nComment=Dvoupanelový správce souborů\nExec=\"{}\"\nIcon=er-commander\nCategories=Utility;FileManager;System;\nTerminal=false\nStartupNotify=true\n",
+        "[Desktop Entry]\nType=Application\nName=eR Commander\nComment=Dvoupanelový správce souborů\nExec=\"{}\"\nIcon=er-commander\nCategories=Utility;FileManager;System;\nTerminal=false\nStartupNotify=true\nStartupWMClass=eR_Commander\n",
         exe_path.display()
     );
     if fs::write(&desktop_path, content).is_err() {
@@ -5477,6 +5477,7 @@ fn main() -> eframe::Result<()> {
         .with_inner_size([win_w as f32, win_h as f32])
         .with_position(egui::pos2(win_x as f32, win_y as f32))
         .with_maximized(win_max)
+        .with_app_id("eR_Commander")
         .with_icon(
             eframe::icon_data::from_png_bytes(
                 include_bytes!("../assets/app_icon.png")
