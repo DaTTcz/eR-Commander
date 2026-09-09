@@ -1457,6 +1457,13 @@ struct UpdateCheckResult {
     download_url: String,
 }
 
+/// Přípona release assetu odpovídající aktuální platformě.
+/// Windows build se publikuje jako .zip (obsahuje .exe),
+/// Linux build jako .tar.gz (obsahuje binárku).
+fn platform_release_asset_suffix() -> &'static str {
+    if cfg!(windows) { ".zip" } else { ".tar.gz" }
+}
+
 /// Úprava velikosti písmen při hromadném přejmenování (Ctrl+M).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RenameCase {
@@ -4558,12 +4565,13 @@ impl FileManagerApp {
                 let version = json["tag_name"].as_str()
                     .ok_or("Nelze přečíst verzi")?.to_string();
                 let assets = json["assets"].as_array().ok_or("Žádné assets")?;
-                let exe_url = assets.iter()
-                    .find(|a| a["name"].as_str().map(|n| n.ends_with(".exe")).unwrap_or(false))
+                let suffix = platform_release_asset_suffix();
+                let asset_url = assets.iter()
+                    .find(|a| a["name"].as_str().map(|n| n.ends_with(suffix)).unwrap_or(false))
                     .and_then(|a| a["browser_download_url"].as_str())
-                    .ok_or("Žádný .exe asset")?
+                    .ok_or("Žádný release asset pro tuto platformu")?
                     .to_string();
-                Ok(UpdateCheckResult { version, download_url: exe_url })
+                Ok(UpdateCheckResult { version, download_url: asset_url })
             })();
             let _ = tx.send(result);
         });
@@ -4595,17 +4603,19 @@ impl FileManagerApp {
                 let version = json["tag_name"].as_str()
                     .ok_or("Nelze přečíst verzi")?.to_string();
 
-                // Hledáme .exe asset pro Windows
+                // Hledáme release asset odpovídající aktuální platformě
+                // (Windows = .zip, Linux = .tar.gz)
                 let assets = json["assets"].as_array()
                     .ok_or("Žádné assets")?;
-                let exe_url = assets.iter()
+                let suffix = platform_release_asset_suffix();
+                let asset_url = assets.iter()
                     .find(|a| a["name"].as_str()
-                        .map(|n| n.ends_with(".exe")).unwrap_or(false))
+                        .map(|n| n.ends_with(suffix)).unwrap_or(false))
                     .and_then(|a| a["browser_download_url"].as_str())
-                    .ok_or("Žádný .exe asset")?
+                    .ok_or("Žádný release asset pro tuto platformu")?
                     .to_string();
 
-                Ok(UpdateCheckResult { version, download_url: exe_url })
+                Ok(UpdateCheckResult { version, download_url: asset_url })
             })();
 
             let _ = tx.send(result);
@@ -4676,32 +4686,110 @@ impl FileManagerApp {
                 let current_exe = std::env::current_exe()
                     .map_err(|e| format!("Cesta k exe: {}", e))?;
 
-                // Na Windows nelze přepsat spuštěný exe přímo.
-                // Strategie: uložíme nový exe jako .new, spustíme batch
-                // skript který po ukončení starého exe provede přepis.
-                let new_exe = current_exe.with_extension("exe.new");
-                let bat_path = current_exe.with_extension("update.bat");
+                if cfg!(windows) {
+                    // Windows: staženy je .zip obsahující .exe. Rozbalíme
+                    // .exe z archivu do .exe.new, spustíme batch skript,
+                    // který po ukončení tohoto procesu provede přepis
+                    // a znovu spustí aplikaci (běžící .exe nelze na
+                    // Windows přepsat přímo).
+                    let zip_path = current_exe.with_extension("zip.update");
+                    fs::write(&zip_path, &bytes)
+                        .map_err(|e| format!("Zápis staženého ZIP: {}", e))?;
 
-                fs::write(&new_exe, &bytes)
-                    .map_err(|e| format!("Zápis nového exe: {}", e))?;
+                    let zf = File::open(&zip_path)
+                        .map_err(|e| format!("Otevření ZIP: {}", e))?;
+                    let mut archive = zip::ZipArchive::new(zf)
+                        .map_err(|e| format!("Čtení ZIP: {}", e))?;
 
-                // Batch skript čeká na ukončení starého procesu a pak přepíše
-                let current_name = current_exe.to_string_lossy().to_string();
-                let new_name     = new_exe.to_string_lossy().to_string();
-                let bat_content  = format!(
-                    "@echo off\r\ntimeout /t 2 /nobreak >nul\r\nmove /y \"{new}\" \"{cur}\"\r\nstart \"\" \"{cur}\"\r\ndel \"%~f0\"",
-                    new = new_name, cur = current_name
-                );
-                fs::write(&bat_path, bat_content)
-                    .map_err(|e| format!("Zápis bat skriptu: {}", e))?;
+                    let new_exe = current_exe.with_extension("exe.new");
+                    let mut extracted = false;
+                    for i in 0..archive.len() {
+                        let mut entry = archive.by_index(i)
+                            .map_err(|e| format!("Čtení ZIP položky: {}", e))?;
+                        if entry.name().to_lowercase().ends_with(".exe") {
+                            let mut out = File::create(&new_exe)
+                                .map_err(|e| format!("Zápis nového exe: {}", e))?;
+                            std::io::copy(&mut entry, &mut out)
+                                .map_err(|e| format!("Rozbalení exe: {}", e))?;
+                            extracted = true;
+                            break;
+                        }
+                    }
+                    let _ = fs::remove_file(&zip_path);
+                    if !extracted {
+                        return Err("V ZIP archivu nebyl nalezen .exe soubor".to_string());
+                    }
 
-                // Spustíme batch skript a ukončíme se
-                std::process::Command::new("cmd")
-                    .args(["/C", &bat_path.to_string_lossy()])
-                    .spawn()
-                    .map_err(|e| format!("Spuštění updatéru: {}", e))?;
+                    let bat_path = current_exe.with_extension("update.bat");
+                    let current_name = current_exe.to_string_lossy().to_string();
+                    let new_name     = new_exe.to_string_lossy().to_string();
+                    let bat_content  = format!(
+                        "@echo off\r\ntimeout /t 2 /nobreak >nul\r\nmove /y \"{new}\" \"{cur}\"\r\nstart \"\" \"{cur}\"\r\ndel \"%~f0\"",
+                        new = new_name, cur = current_name
+                    );
+                    fs::write(&bat_path, bat_content)
+                        .map_err(|e| format!("Zápis bat skriptu: {}", e))?;
 
-                std::process::exit(0);
+                    std::process::Command::new("cmd")
+                        .args(["/C", &bat_path.to_string_lossy()])
+                        .spawn()
+                        .map_err(|e| format!("Spuštění updatéru: {}", e))?;
+
+                    std::process::exit(0);
+                } else {
+                    // Linux: stažený je .tar.gz obsahující binárku. Na
+                    // Linuxu lze spuštěný soubor bezpečně nahradit
+                    // přejmenováním - proces si drží starou inode dál
+                    // otevřenou, dokud sám neskončí.
+                    let tmp_dir = current_exe.parent()
+                        .ok_or("Neznámý adresář aplikace")?
+                        .join(".er_commander_update_tmp");
+                    let _ = fs::remove_dir_all(&tmp_dir);
+                    fs::create_dir_all(&tmp_dir)
+                        .map_err(|e| format!("Vytvoření dočasného adresáře: {}", e))?;
+
+                    let archive_path = tmp_dir.join("update.tar.gz");
+                    fs::write(&archive_path, &bytes)
+                        .map_err(|e| format!("Zápis archivu: {}", e))?;
+
+                    let status = std::process::Command::new("tar")
+                        .args(["xzf", &archive_path.to_string_lossy(), "-C", &tmp_dir.to_string_lossy()])
+                        .status()
+                        .map_err(|e| format!("Spuštění tar: {}", e))?;
+                    if !status.success() {
+                        let _ = fs::remove_dir_all(&tmp_dir);
+                        return Err("Rozbalení archivu selhalo".to_string());
+                    }
+
+                    let bin_name = current_exe.file_name()
+                        .ok_or("Neznámý název binárky")?;
+                    let new_bin = tmp_dir.join(bin_name);
+                    if !new_bin.exists() {
+                        let _ = fs::remove_dir_all(&tmp_dir);
+                        return Err("V archivu nebyla nalezena binárka".to_string());
+                    }
+
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = fs::metadata(&new_bin) {
+                            let mut perms = meta.permissions();
+                            perms.set_mode(0o755);
+                            let _ = fs::set_permissions(&new_bin, perms);
+                        }
+                    }
+
+                    fs::rename(&new_bin, &current_exe)
+                        .map_err(|e| format!("Nahrazení binárky: {}", e))?;
+
+                    let _ = fs::remove_dir_all(&tmp_dir);
+
+                    std::process::Command::new(&current_exe)
+                        .spawn()
+                        .map_err(|e| format!("Spuštění nové verze: {}", e))?;
+
+                    std::process::exit(0);
+                }
             })();
 
             if let Err(e) = result {
