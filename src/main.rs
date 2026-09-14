@@ -20,7 +20,6 @@
 use eframe::egui;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event as FsEvent};
 use regex::Regex;
-use serde_json;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -34,7 +33,8 @@ use chrono::{DateTime, Local};
 const APP_AUTHOR:  &str = "David Trubka";
 const APP_CONTACT: &str = "DaTT.cz";
 // GitHub repo pro auto-update – uprav na svůj vlastní repo
-const GITHUB_REPO: &str = "DaTTcz/eR-Commander";
+const GITHUB_OWNER: &str = "DaTTcz";
+const GITHUB_REPO_NAME: &str = "eR-Commander";
 
 // =====================================================================
 // Datové struktury
@@ -1470,11 +1470,39 @@ struct UpdateCheckResult {
     download_url: String,
 }
 
-/// Přípona release assetu odpovídající aktuální platformě.
-/// Windows build se publikuje jako .zip (obsahuje .exe),
-/// Linux build jako .tar.gz (obsahuje binárku).
-fn platform_release_asset_suffix() -> &'static str {
-    if cfg!(windows) { ".zip" } else { ".tar.gz" }
+/// Zjistí nejnovější GitHub Release repozitáře a najde v jeho assetech
+/// soubor pro aktuální platformu - stejný přístup jako v Term-IX
+/// (crates/termx-update), jen bez použití `self_update::Update` pro
+/// samotné stažení (to si eR Commander řeší vlastním kódem kvůli
+/// vlastnímu progress dialogu v okně, viz `download_and_replace`).
+///
+/// Release proces (`.github/workflows/release.yml`) pojmenovává assety
+/// tak, aby obsahovaly cílový target triple, např.:
+///   eR_Commander-x86_64-pc-windows-msvc.zip
+///   eR_Commander-x86_64-unknown-linux-gnu.tar.gz
+/// `self_update::get_target()` vrátí triple aktuálního buildu, podle
+/// kterého se v assetech hledá ten správný.
+fn fetch_latest_release() -> Result<UpdateCheckResult, String> {
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner(GITHUB_OWNER)
+        .repo_name(GITHUB_REPO_NAME)
+        .build()
+        .map_err(|e| e.to_string())?
+        .fetch()
+        .map_err(|e| e.to_string())?;
+
+    let latest = releases.first()
+        .ok_or("Na GitHubu zatím neexistuje žádný release")?;
+
+    let target = self_update::get_target();
+    let asset = latest.assets.iter()
+        .find(|a| a.name.contains(target))
+        .ok_or_else(|| format!("Žádný release asset pro platformu {}", target))?;
+
+    Ok(UpdateCheckResult {
+        version: latest.version.clone(),
+        download_url: asset.download_url.clone(),
+    })
 }
 
 /// Úprava velikosti písmen při hromadném přejmenování (Ctrl+M).
@@ -4631,29 +4659,8 @@ impl FileManagerApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_check_rx = Some(rx);
 
-        let repo = GITHUB_REPO.to_string();
         thread::spawn(move || {
-            let result = (|| -> Result<UpdateCheckResult, String> {
-                let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-                let client = reqwest::blocking::Client::builder()
-                    .user_agent("er-commander-updater")
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                let resp = client.get(&url).send().map_err(|e| e.to_string())?;
-                let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-                let version = json["tag_name"].as_str()
-                    .ok_or("Nelze přečíst verzi")?.to_string();
-                let assets = json["assets"].as_array().ok_or("Žádné assets")?;
-                let suffix = platform_release_asset_suffix();
-                let asset_url = assets.iter()
-                    .find(|a| a["name"].as_str().map(|n| n.ends_with(suffix)).unwrap_or(false))
-                    .and_then(|a| a["browser_download_url"].as_str())
-                    .ok_or("Žádný release asset pro tuto platformu")?
-                    .to_string();
-                Ok(UpdateCheckResult { version, download_url: asset_url })
-            })();
-            let _ = tx.send(result);
+            let _ = tx.send(fetch_latest_release());
         });
     }
 
@@ -4667,38 +4674,8 @@ impl FileManagerApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_check_rx = Some(rx);
 
-        let repo = GITHUB_REPO.to_string();
         thread::spawn(move || {
-            let result = (|| -> Result<UpdateCheckResult, String> {
-                let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-                let client = reqwest::blocking::Client::builder()
-                    .user_agent("er-commander-updater")
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .map_err(|e| e.to_string())?;
-
-                let resp = client.get(&url).send().map_err(|e| e.to_string())?;
-                let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-
-                let version = json["tag_name"].as_str()
-                    .ok_or("Nelze přečíst verzi")?.to_string();
-
-                // Hledáme release asset odpovídající aktuální platformě
-                // (Windows = .zip, Linux = .tar.gz)
-                let assets = json["assets"].as_array()
-                    .ok_or("Žádné assets")?;
-                let suffix = platform_release_asset_suffix();
-                let asset_url = assets.iter()
-                    .find(|a| a["name"].as_str()
-                        .map(|n| n.ends_with(suffix)).unwrap_or(false))
-                    .and_then(|a| a["browser_download_url"].as_str())
-                    .ok_or("Žádný release asset pro tuto platformu")?
-                    .to_string();
-
-                Ok(UpdateCheckResult { version, download_url: asset_url })
-            })();
-
-            let _ = tx.send(result);
+            let _ = tx.send(fetch_latest_release());
         });
     }
 

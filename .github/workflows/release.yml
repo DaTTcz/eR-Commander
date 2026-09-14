@@ -61,9 +61,16 @@ jobs:
             libxcb-xfixes0-dev \
             libasound2-dev
 
+      # --locked: builduj presne podle commitnuteho Cargo.lock (viz README
+      # k tomuto repu / historie Cargo.lock) - zadne "tise jina verze
+      # zavislosti", stejne jako u Term-IX.
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # Nazev souboru MUSI obsahovat cely target triple (ne jen "hezke"
+      # jmeno jako drive) - podle nej hleda spravny asset self-update kod
+      # v main.rs (fetch_latest_release / self_update::get_target()),
+      # stejny princip jako v Term-IX (crates/termx-update).
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -72,7 +79,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${BIN_NAME}.exe" "dist/"
           cd dist
-          7z a "${BIN_NAME}-${{ matrix.artifact }}.zip" "${BIN_NAME}.exe"
+          7z a "${BIN_NAME}-${{ matrix.target }}.zip" "${BIN_NAME}.exe"
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -83,7 +90,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/"
           chmod +x "dist/${BIN_NAME}"
           cd dist
-          tar -czf "${BIN_NAME}-${{ matrix.artifact }}.tar.gz" "${BIN_NAME}"
+          tar -czf "${BIN_NAME}-${{ matrix.target }}.tar.gz" "${BIN_NAME}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

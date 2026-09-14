@@ -1,6 +1,6 @@
 [package]
 name = "er-commander"
-version = "0.8.6"
+version = "0.8.7"
 edition = "2021"
 authors = ["David Trubka"]
 description = "Dvoupanelový správce souborů pro Windows a Linux postavený v Rustu (egui)"
@@ -22,7 +22,6 @@ eframe = "0.28"
 egui_extras = { version = "0.28", features = ["image"] }
 notify = "6"
 regex = "1"
-serde_json = "1"
 walkdir = "2"
 chrono = "0.4"
 rayon = "1"
@@ -30,3 +29,9 @@ zip = "0.6"
 sha2 = "0.10"
 md5 = { package = "md-5", version = "0.10" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Kontrola nejnovejsi verze na GitHubu (viz fetch_latest_release v main.rs) -
+# stejny pristup jako v Term-IX (crates/termx-update). Samotne stazeni a
+# vymenu binarky si eR Commander resi vlastnim kodem (kvuli progress baru
+# v okne), takze zde staci jen "rustls" - bez archive/compression features
+# potrebnych pro self_update::Update.
+self_update = { version = "0.41", default-features = false, features = ["rustls"] }
