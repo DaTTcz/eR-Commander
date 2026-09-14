@@ -1482,6 +1482,14 @@ struct UpdateCheckResult {
 ///   eR_Commander-x86_64-unknown-linux-gnu.tar.gz
 /// `self_update::get_target()` vrátí triple aktuálního buildu, podle
 /// kterého se v assetech hledá ten správný.
+///
+/// POZOR: `ReleaseAsset::download_url` tady NENÍ veřejný
+/// `browser_download_url` ze stránky release, ale GitHub API endpoint
+/// (`.../releases/assets/{id}`) - self_update ho vrací takhle, aby šel
+/// použít i pro assety v soukromých repozitářích s auth tokenem. Funguje
+/// jen s hlavičkou `Accept: application/octet-stream` (jinak vrátí JSON
+/// popis assetu místo bajtů souboru) - viz `download_and_replace`, kde se
+/// tahle hlavička nastavuje.
 fn fetch_latest_release() -> Result<UpdateCheckResult, String> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(GITHUB_OWNER)
@@ -4729,7 +4737,13 @@ impl FileManagerApp {
                     .build()
                     .map_err(|e| format!("HTTP klient: {}", e))?;
 
-                let response = client.get(&url).send()
+                // `url` je GitHub API asset endpoint (viz fetch_latest_release) -
+                // bez téhle hlavičky vrátí JSON popis assetu místo jeho bajtů,
+                // a rozbalení stažené věci pak selže (vypadá jako poškozený
+                // archiv, i když ve skutečnosti se nestáhla žádná binárka).
+                let response = client.get(&url)
+                    .header("Accept", "application/octet-stream")
+                    .send()
                     .map_err(|e| format!("Stahování: {}", e))?;
 
                 let status = response.status();
