@@ -1,6 +1,6 @@
 [package]
 name = "er-commander"
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 authors = ["David Trubka"]
 description = "Dvoupanelový správce souborů pro Windows a Linux postavený v Rustu (egui)"
