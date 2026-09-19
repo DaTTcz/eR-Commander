@@ -5744,8 +5744,20 @@ impl FileManagerApp {
                         .ok_or("Neznámý název binárky")?;
                     let new_bin = tmp_dir.join(bin_name);
                     if !new_bin.exists() {
+                        // Diagnostika: vypíšeme, co jsme čekali a co ve
+                        // skutečnosti tar rozbalil, ať se dá chyba rozklíčovat
+                        // bez ručního stahování archivu a hádání.
+                        let found: Vec<String> = fs::read_dir(&tmp_dir)
+                            .map(|rd| rd.filter_map(|e| e.ok())
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .collect())
+                            .unwrap_or_default();
                         let _ = fs::remove_dir_all(&tmp_dir);
-                        return Err("V archivu nebyla nalezena binárka".to_string());
+                        return Err(format!(
+                            "V archivu nebyla nalezena binárka (čekal jsem soubor \"{}\", v archivu je: {}).",
+                            bin_name.to_string_lossy(),
+                            if found.is_empty() { "(nic)".to_string() } else { found.join(", ") }
+                        ));
                     }
 
                     #[cfg(unix)]
