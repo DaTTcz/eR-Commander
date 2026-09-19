@@ -108,7 +108,7 @@ cd eR-Commander
 cargo build --release
 ```
 
-Výsledný exe bude v `target\release\eR_Commander.exe`.
+Výsledný exe bude v `target\release\`.
 
 ---
 
