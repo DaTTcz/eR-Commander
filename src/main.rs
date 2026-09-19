@@ -182,6 +182,10 @@ struct Panel {
     show_hidden: bool,
     inline_rename_idx: Option<usize>,
     inline_rename_buf: String, // bylo kliknuto na složku? → spustit výpočet velikosti
+    // Kolik znaků (od začátku) se má při otevření inline rename označit -
+    // None = žádné čekající označení, Some(n) = jednorázově označit 0..n
+    // znaků (viz `rename_select_end`), pak se nastaví zpět na None.
+    inline_rename_select_end: Option<usize>,
     sort_col: SortColumn,
     sort_dir: SortDir,
     dir_sort: DirSort,
@@ -205,6 +209,7 @@ impl Panel {
             show_hidden: false,
             inline_rename_idx: None,
             inline_rename_buf: String::new(),
+            inline_rename_select_end: None,
             sort_col: SortColumn::Name,
             sort_dir: SortDir::Asc,
             dir_sort: DirSort::FirstByCol,
@@ -1694,6 +1699,23 @@ fn resolve_gvfs_mount_path(protocol: NetShareProtocol, server: &str, share: &str
 // umístění se objeví jako položky s `standard::target-uri`).
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Kolik znaků od začátku názvu `name` se má při otevření inline
+/// přejmenování (F2) rovnou označit. `select_ext == true` označí celý
+/// název včetně přípony; jinak (výchozí, jako v Průzkumníku/Total
+/// Commanderu) jen část před poslední tečkou - ale ne u "skrytých"
+/// jmen typu ".bashrc", kde tečka na první pozici není oddělovač
+/// přípony (tam se označí celý název).
+fn rename_select_end(name: &str, select_ext: bool) -> usize {
+    let total_chars = name.chars().count();
+    if select_ext {
+        return total_chars;
+    }
+    match name.rfind('.') {
+        Some(byte_idx) if byte_idx > 0 => name[..byte_idx].chars().count(),
+        _ => total_chars,
+    }
+}
+
 /// Rozhodne, zda dané URI odpovídá konkrétnímu sdílení k připojení
 /// (vrátí `Some((protokol, server, share))`), nebo je to jen uzel k
 /// dalšímu procházení (server bez uvedeného sdílení, workgroup apod. -
@@ -2129,6 +2151,9 @@ struct FileManagerApp {
     show_hidden: bool,
     external_editor: String,  // cesta k externímu editoru (exe)
     dir_sort: DirSort,
+    // Při F2/inline rename rovnou označit i příponu souboru (false = jen
+    // název bez přípony, jako v Průzkumníku/Total Commanderu)
+    rename_select_ext: bool,
 
     // Auto-update
     update_check_rx: Option<std::sync::mpsc::Receiver<Result<UpdateCheckResult, String>>>,
@@ -2341,6 +2366,11 @@ impl Default for FileManagerApp {
                         _             => DirSort::FirstByCol,
                     }))
                 .unwrap_or(DirSort::FirstByCol),
+            rename_select_ext: fs::read_to_string(state_file_path()).ok()
+                .and_then(|c| c.lines()
+                    .find(|l| l.starts_with("RENAME_SELECT_EXT="))
+                    .map(|l| l["RENAME_SELECT_EXT=".len()..].trim() == "true"))
+                .unwrap_or(false),
             update_check_rx: None,
             update_state: UpdateState::Idle,
             show_update_dialog: false,
@@ -2825,6 +2855,7 @@ impl FileManagerApp {
         content.push_str(&format!("DARK_MODE={}\n",   self.dark_mode));
         content.push_str(&format!("SHOW_HIDDEN={}\n", self.show_hidden));
         content.push_str(&format!("EXT_EDITOR={}\n",  self.external_editor));
+        content.push_str(&format!("RENAME_SELECT_EXT={}\n", self.rename_select_ext));
         content.push_str(&format!("DIR_SORT={}\n", match self.dir_sort {
             DirSort::FirstByName => "FirstByName",
             DirSort::FirstByCol  => "FirstByCol",
@@ -3297,6 +3328,7 @@ impl FileManagerApp {
             ActivePanel::Right => &mut self.right,
         };
         panel.inline_rename_idx = Some(idx);
+        panel.inline_rename_select_end = Some(rename_select_end(&name, self.rename_select_ext));
         panel.inline_rename_buf = name;
     }
 
@@ -4534,6 +4566,21 @@ impl FileManagerApp {
                         self.left.refresh();
                         self.right.refresh();
                     }
+                });
+
+                ui.add_space(8.0);
+
+                // Přejmenování (F2)
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Přejmenování (F2)").strong());
+                    ui.separator();
+                    let was = self.rename_select_ext;
+                    ui.checkbox(&mut self.rename_select_ext,
+                        "Při otevření přejmenování označit i příponu souboru");
+                    ui.label(egui::RichText::new(
+                        "Když je vypnuto (výchozí), označí se jen název bez přípony - jako v Průzkumníku/Total Commanderu.")
+                        .small().color(egui::Color32::GRAY));
+                    if self.rename_select_ext != was { changed = true; }
                 });
 
                 ui.add_space(8.0);
@@ -6298,12 +6345,26 @@ fn render_panel(
                     // nahradí řádek dané položky, ne celý seznam nahoře.
                     if panel.inline_rename_idx == Some(i) {
                         let mut handled = false;
+                        // Explicitní (nikoli odvozené id_source) id - potřebujeme
+                        // ho znát PŘED vykreslením widgetu, abychom mu mohli
+                        // jednorázově nastavit počáteční výběr textu.
+                        let rename_id = egui::Id::new((which, "inline_rename"));
+                        if let Some(select_end) = panel.inline_rename_select_end.take() {
+                            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), rename_id)
+                                .unwrap_or_default();
+                            let range = egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(select_end),
+                            );
+                            state.cursor.set_char_range(Some(range));
+                            state.store(ui.ctx(), rename_id);
+                        }
                         ui.horizontal(|ui| {
                             ui.add_space(ICO_W);
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut panel.inline_rename_buf)
                                     .desired_width(name_w)
-                                    .id_source((which, "inline_rename")),
+                                    .id(rename_id),
                             );
                             resp.request_focus();
                             // Enter a Esc čteme přímo - nezávisí na lost_focus
