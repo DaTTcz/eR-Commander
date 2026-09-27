@@ -1,0 +1,39 @@
+# Popis .deb a .rpm balíčku pro nfpm (https://nfpm.goreleaser.com).
+# VERSION dosazuje workflow (.github/workflows/build.yml) z Cargo.toml.
+# Binárka jde do /usr/bin - appka to pozná (InstallMode::Package v main.rs)
+# a místo samo-aktualizace nabídne stažení nového balíčku.
+name: er-commander
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: David Trubka (DaTT.cz)
+vendor: DaTT.cz
+homepage: https://github.com/DaTTcz/eR-Commander
+license: PolyForm-Noncommercial-1.0.0
+description: |
+  Dvoupanelový správce souborů pro Linux a Windows (Rust/egui).
+  Síťové složky SMB/NFS přes GVfs (gio), záložky, ZIP jako složka.
+
+contents:
+  - src: ./dist/eR_Commander
+    dst: /usr/bin/eR_Commander
+    file_info:
+      mode: 0755
+  - src: ./packaging/linux/eR_Commander.desktop
+    dst: /usr/share/applications/eR_Commander.desktop
+  - src: ./assets/app_icon.png
+    dst: /usr/share/icons/hicolor/256x256/apps/er-commander.png
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+    # gio + GVfs backendy = připojování SMB/NFS a procházení "Síť"
+    recommends:
+      - libglib2.0-bin
+      - gvfs-backends
+  rpm:
+    recommends:
+      - gvfs

@@ -1,0 +1,308 @@
+name: Build
+
+# Tři úrovně podle toho, co workflow spustí (stejný princip jako FFMPEG Master):
+#
+# - push do main / pull request -> jen rychlá kontrola "check": cargo check
+#   (Linux + Windows) a cargo test (Linux). Pár minut, nic se nevydává.
+#
+# - ruční spuštění (Actions -> Build -> Run workflow) -> check + plný build
+#   všech balíčků + test na distribucích, ale BEZ vydání releasu. Na
+#   vyzkoušení změn v buildu.
+#
+# - push tagu "v*" (např. v0.8.12) -> plný build + test na distribucích +
+#   GitHub Release. Release vznikne jen tehdy, když všechny testy projdou.
+#   Tag musí odpovídat verzi v Cargo.toml, jinak build skončí chybou
+#   (poučení z v0.8.9, kdy binárka hlásila starou verzi).
+#
+# Soubory v releasu:
+#   eR_Commander-x86_64-pc-windows-msvc.zip       Windows (+ samo-aktualizace)
+#   eR_Commander-x86_64-unknown-linux-gnu.tar.gz  Linux přenosná binárka (+ samo-aktualizace)
+#   eR_Commander-x86_64.AppImage                  Linux univerzální (+ samo-aktualizace)
+#   er-commander_<verze>_amd64.deb                Debian / Ubuntu / Mint
+#   er-commander-<verze>.x86_64.rpm               openSUSE / Fedora
+#
+# POZOR: názvy zip/tar.gz MUSÍ obsahovat celý target triple - podle něj
+# hledá asset samo-aktualizace v main.rs (fetch_latest_release). AppImage,
+# .deb a .rpm ho naopak mít NESMÍ, aby se s tar.gz nepletly.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: eR_Commander
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Rychlá kontrola (každý push do main / PR) ────────────────────────────
+  check:
+    if: "!startsWith(github.ref, 'refs/tags/v')"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux GUI build závislosti
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev
+      - name: cargo check
+        run: cargo check --locked --all-targets
+      - name: cargo test
+        if: runner.os == 'Linux'
+        run: cargo test --locked
+
+  # ── Verze z Cargo.toml (+ kontrola proti tagu) ──────────────────────────
+  version:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          echo "Verze v Cargo.toml: $VERSION"
+          if [ -z "$VERSION" ]; then echo "::error::V Cargo.toml nebyla nalezena verze"; exit 1; fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} neodpovídá verzi v Cargo.toml (v${VERSION})"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # ── Windows ─────────────────────────────────────────────────────────────
+  build-windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Zabalit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/x86_64-pc-windows-msvc/release/${BIN_NAME}.exe" dist/
+          cd dist
+          7z a "${BIN_NAME}-x86_64-pc-windows-msvc.zip" "${BIN_NAME}.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── Linux: build ve starém Ubuntu kvůli glibc ───────────────────────────
+  # Binárka postavená na ubuntu-latest (glibc 2.39) se na starších
+  # distribucích nespustí ("GLIBC_2.xx not found") - stejná zkušenost jako
+  # u FFMPEG Master. Build uvnitř ubuntu:22.04 (glibc 2.35) poběží všude
+  # novějším (Mint 21+, Debian 12+, Fedora, openSUSE...).
+  build-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Systémové balíčky
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl wget git file build-essential pkg-config \
+            libgtk-3-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Kontrola binárky
+        run: |
+          B="target/x86_64-unknown-linux-gnu/release/${BIN_NAME}"
+          file "$B"
+          ldd "$B" || true
+          OUT=$("$B" --version)
+          echo "$OUT"
+          [ "$OUT" = "eR Commander ${VERSION}" ] || { echo "::error::Binárka hlásí '$OUT', čekám verzi ${VERSION}"; exit 1; }
+          mkdir -p dist
+          cp "$B" dist/
+          chmod +x "dist/${BIN_NAME}"
+
+      - name: tar.gz (přenosná binárka)
+        run: tar -czf "${BIN_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C dist "${BIN_NAME}"
+
+      - name: AppImage
+        run: |
+          set -e
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp "dist/${BIN_NAME}" AppDir/usr/bin/
+          cp packaging/linux/eR_Commander.desktop AppDir/usr/share/applications/
+          cp packaging/linux/eR_Commander.desktop AppDir/
+          cp assets/app_icon.png AppDir/usr/share/icons/hicolor/256x256/apps/er-commander.png
+          cp assets/app_icon.png AppDir/er-commander.png
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/eR_Commander" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -O appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          ./appimagetool.AppImage --appimage-extract > /dev/null
+          ARCH=x86_64 ./squashfs-root/AppRun AppDir "${BIN_NAME}-x86_64.AppImage"
+          chmod +x "${BIN_NAME}-x86_64.AppImage"
+
+      - name: .deb a .rpm (nfpm)
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' > /etc/apt/sources.list.d/goreleaser.list
+          apt-get update
+          apt-get install -y nfpm
+          nfpm package -f packaging/linux/nfpm.yaml -p deb -t "er-commander_${VERSION}_amd64.deb"
+          nfpm package -f packaging/linux/nfpm.yaml -p rpm -t "er-commander-${VERSION}.x86_64.rpm"
+          ls -la *.tar.gz *.AppImage *.deb *.rpm
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-tar
+          path: ${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-appimage
+          path: ${{ env.BIN_NAME }}-x86_64.AppImage
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-deb
+          path: er-commander_*_amd64.deb
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-rpm
+          path: er-commander-*.x86_64.rpm
+          if-no-files-found: error
+
+  # ── Test na distribucích ────────────────────────────────────────────────
+  # GUI se v CI spustit nedá, ale `--version` ověří to podstatné: že se
+  # binárka na dané distribuci vůbec načte (glibc, knihovny) a že balíček
+  # jde nainstalovat a dá program do PATH.
+  test-linux:
+    needs: [version, build-linux]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 22.04 (.deb + AppImage)
+            image: ubuntu:22.04
+            package: deb
+          - name: Ubuntu 24.04 (.deb + AppImage)
+            image: ubuntu:24.04
+            package: deb
+          - name: Debian 13 (.deb + AppImage)
+            image: debian:trixie
+            package: deb
+          - name: Fedora (.rpm + AppImage)
+            image: fedora:latest
+            package: rpm
+          - name: openSUSE Tumbleweed (.rpm + AppImage)
+            image: opensuse/tumbleweed
+            package: rpm
+          - name: Arch Linux (tar.gz + AppImage)
+            image: archlinux:latest
+            package: none
+    name: Test ${{ matrix.name }}
+    container:
+      image: ${{ matrix.image }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: linux-*
+          path: pkg
+          merge-multiple: true
+      - name: Instalace balíčku
+        shell: bash
+        run: |
+          set -e
+          ls -la pkg
+          case "${{ matrix.package }}" in
+            deb)
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends ./pkg/*.deb ;;
+            rpm)
+              if command -v zypper >/dev/null; then
+                zypper --non-interactive install --allow-unsigned-rpm --no-recommends ./pkg/*.rpm
+              else
+                dnf install -y --setopt=install_weak_deps=False ./pkg/*.rpm
+              fi ;;
+            none) : ;;
+          esac
+      - name: Spuštění (--version)
+        shell: bash
+        run: |
+          set -u
+          failed=0
+          check() {
+            local label="$1"; shift
+            local out
+            out=$("$@" 2>&1); local rc=$?
+            echo "$label: $out"
+            if [ $rc -ne 0 ] || [ "$out" != "eR Commander ${VERSION}" ]; then
+              echo "::error::$label: spuštění selhalo (kód $rc): $out"
+              failed=1
+            fi
+          }
+          if [ "${{ matrix.package }}" != "none" ]; then
+            check "Nainstalovaný .${{ matrix.package }}" eR_Commander --version
+            test -f /usr/share/applications/eR_Commander.desktop || { echo "::error::Chybí .desktop soubor"; failed=1; }
+          else
+            mkdir -p tarbin && tar -xzf pkg/eR_Commander-x86_64-unknown-linux-gnu.tar.gz -C tarbin
+            check "tar.gz binárka" ./tarbin/eR_Commander --version
+          fi
+          chmod +x pkg/eR_Commander-x86_64.AppImage
+          check "AppImage" ./pkg/eR_Commander-x86_64.AppImage --appimage-extract-and-run --version
+          exit $failed
+
+  # ── Release (jen z tagu, jen když všechno prošlo) ────────────────────────
+  release:
+    needs: [build-windows, build-linux, test-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls -la artifacts
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/*.AppImage
+            artifacts/*.deb
+            artifacts/*.rpm
+          generate_release_notes: true

@@ -2457,6 +2457,35 @@ fn gio_browse_worker(uri: String) -> Result<Vec<(String, String)>, String> {
 /// jen s hlavičkou `Accept: application/octet-stream` (jinak vrátí JSON
 /// popis assetu místo bajtů souboru) - viz `download_and_replace`, kde se
 /// tahle hlavička nastavuje.
+/// Jak je appka na tomhle počítači "nainstalovaná" - podle toho se liší
+/// automatická aktualizace (co stáhnout a kam) a zástupce v menu.
+#[derive(Clone, Debug, PartialEq)]
+enum InstallMode {
+    /// Samostatná binárka (tar.gz / zip z GitHubu) - aktualizuje se výměnou souboru.
+    Portable,
+    /// Linux AppImage - aktualizuje se výměnou celého .AppImage souboru
+    /// (cesta v proměnné APPIMAGE; `current_exe()` ukazuje dovnitř
+    /// dočasně připojeného read-only obrazu a přepsat nejde).
+    AppImage(PathBuf),
+    /// Nainstalováno balíčkem .deb / .rpm do /usr - soubory patří správci
+    /// balíčků, appka je přepisovat nesmí; nabídne stažení nového balíčku.
+    Package,
+}
+
+fn install_mode() -> InstallMode {
+    if cfg!(target_os = "linux") {
+        if let Some(p) = std::env::var_os("APPIMAGE") {
+            if !p.is_empty() { return InstallMode::AppImage(PathBuf::from(p)); }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if exe.starts_with("/usr/") || exe.starts_with("/opt/") {
+                return InstallMode::Package;
+            }
+        }
+    }
+    InstallMode::Portable
+}
+
 fn fetch_latest_release() -> Result<UpdateCheckResult, String> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(GITHUB_OWNER)
@@ -2469,10 +2498,30 @@ fn fetch_latest_release() -> Result<UpdateCheckResult, String> {
     let latest = releases.first()
         .ok_or("Na GitHubu zatím neexistuje žádný release")?;
 
-    let target = self_update::get_target();
-    let asset = latest.assets.iter()
-        .find(|a| a.name.contains(target))
-        .ok_or_else(|| format!("Žádný release asset pro platformu {}", target))?;
+    // Balíček (.deb/.rpm): nic nestahujeme, "URL" je stránka releasu,
+    // kterou appka otevře v prohlížeči (viz download_and_replace).
+    if install_mode() == InstallMode::Package {
+        return Ok(UpdateCheckResult {
+            version: latest.version.clone(),
+            download_url: format!(
+                "https://github.com/{}/{}/releases/tag/v{}",
+                GITHUB_OWNER, GITHUB_REPO_NAME, latest.version.trim_start_matches('v')
+            ),
+        });
+    }
+
+    let asset = if matches!(install_mode(), InstallMode::AppImage(_)) {
+        latest.assets.iter()
+            .find(|a| a.name.ends_with(".AppImage"))
+            .ok_or("Nejnovější release neobsahuje AppImage")?
+    } else {
+        // Assety s celým target triple (tar.gz / zip) - AppImage/deb/rpm
+        // ho v názvu záměrně nemají, aby se sem nepletly.
+        let target = self_update::get_target();
+        latest.assets.iter()
+            .find(|a| a.name.contains(target))
+            .ok_or_else(|| format!("Žádný release asset pro platformu {}", target))?
+    };
 
     Ok(UpdateCheckResult {
         version: latest.version.clone(),
@@ -6430,6 +6479,21 @@ impl FileManagerApp {
     fn download_and_replace(&mut self) {
         let UpdateState::UpdateAvailable { url, .. } = &self.update_state else { return };
         let url = url.clone();
+
+        // Instalace z balíčku: soubory v /usr patří správci balíčků -
+        // otevřeme stránku releasu, uživatel si stáhne nový .deb/.rpm.
+        if install_mode() == InstallMode::Package {
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            self.update_state = UpdateState::Idle;
+            self.show_update_dialog = false;
+            self.op_status = Some(StatusMsg::Info(
+                "Otevřena stránka s novou verzí - stáhni a nainstaluj balíček .deb / .rpm.".to_string()));
+            return;
+        }
+        let appimage_path = match install_mode() {
+            InstallMode::AppImage(p) => Some(p),
+            _ => None,
+        };
         self.update_state = UpdateState::Downloading;
 
         // Použijeme existující update_check_rx pro zpětnou vazbu o chybě
@@ -6463,6 +6527,27 @@ impl FileManagerApp {
 
                 let current_exe = std::env::current_exe()
                     .map_err(|e| format!("Cesta k exe: {}", e))?;
+
+                if let Some(appimage) = appimage_path {
+                    // AppImage: stažený soubor JE nová verze celé appky -
+                    // zapíšeme ho vedle, nastavíme spustitelnost a
+                    // přejmenováním nahradíme původní .AppImage (běžící
+                    // proces si drží starou inode, takže to jde za běhu).
+                    let new_path = appimage.with_extension("AppImage.new");
+                    fs::write(&new_path, &bytes)
+                        .map_err(|e| format!("Zápis nové AppImage: {}", e))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&new_path, fs::Permissions::from_mode(0o755));
+                    }
+                    fs::rename(&new_path, &appimage)
+                        .map_err(|e| format!("Nahrazení AppImage: {}", e))?;
+                    std::process::Command::new(&appimage)
+                        .spawn()
+                        .map_err(|e| format!("Spuštění nové verze: {}", e))?;
+                    std::process::exit(0);
+                }
 
                 if cfg!(windows) {
                     // Windows: staženy je .zip obsahující .exe. Rozbalíme
@@ -6616,7 +6701,12 @@ impl FileManagerApp {
                         ui.label(format!("Aktuální verze: v{}", env!("CARGO_PKG_VERSION")));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("⬇ Stáhnout a nainstalovat").clicked() {
+                            let label = if install_mode() == InstallMode::Package {
+                                "🌐 Otevřít stránku s balíčky"
+                            } else {
+                                "⬇ Stáhnout a nainstalovat"
+                            };
+                            if ui.button(label).clicked() {
                                 self.download_and_replace();
                             }
                             if ui.button("Později").clicked() { close = true; }
@@ -7392,8 +7482,24 @@ fn load_window_state() -> Option<(i32, i32, i32, i32, bool)> {
 fn ensure_linux_desktop_entry() {
     use std::io::Write;
 
-    let Ok(exe_path) = std::env::current_exe() else { return };
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let apps_dir_user = home.join(".local/share/applications");
+    let exe_path = match install_mode() {
+        // AppImage: current_exe() je uvnitř dočasného /tmp/.mount_* - do
+        // zástupce patří cesta k samotnému .AppImage souboru.
+        InstallMode::AppImage(p) => p,
+        // Balíček si přináší vlastní zástupce v /usr/share/applications -
+        // uživatelský (z dřívější přenosné verze) by ho překryl a mohl
+        // ukazovat na starou cestu, takže ho uklidíme a nic nezapisujeme.
+        InstallMode::Package => {
+            let _ = fs::remove_file(apps_dir_user.join("eR_Commander.desktop"));
+            return;
+        }
+        InstallMode::Portable => {
+            let Ok(p) = std::env::current_exe() else { return };
+            p
+        }
+    };
 
     let icon_dir = home.join(".local/share/icons/hicolor/256x256/apps");
     let apps_dir = home.join(".local/share/applications");
@@ -7449,6 +7555,13 @@ fn ensure_linux_desktop_entry() {
 }
 
 fn main() -> eframe::Result<()> {
+    // `--version`: vypíše verzi a skončí bez GUI - používá ho CI k ověření,
+    // že se binárka (AppImage/.deb/.rpm) na dané distribuci vůbec spustí.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("eR Commander {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     #[cfg(target_os = "linux")]
     ensure_linux_desktop_entry();
 

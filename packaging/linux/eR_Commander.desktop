@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=eR Commander
+Comment=Dvoupanelový správce souborů
+Exec=eR_Commander
+Icon=er-commander
+Categories=Utility;FileManager;System;
+Terminal=false
+StartupNotify=true
+StartupWMClass=eR_Commander
