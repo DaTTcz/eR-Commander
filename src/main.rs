@@ -448,9 +448,46 @@ impl Panel {
 
     /// Přejde na cestu zadanou ručně v textovém poli (podporuje UNC cesty
     /// typu \\NAS\share\slozka i běžné lokální cesty). Funguje jen mimo archiv.
-    fn navigate_to_input(&mut self) -> Result<(), String> {
-        let candidate = PathBuf::from(self.path_input.trim());
+    ///
+    /// Síťové adresy: `smb://server/share[/podsložka]` a `nfs://server/export`
+    /// (na Linuxu) vrátí akci k připojení přes GVfs - appka sdílení sama
+    /// připojí a skočí do něj; `smb://server/` bez sdílení otevře výpis
+    /// sdílení na serveru (jako "🌐 Síť"). Neexistující GVfs cesta (např.
+    /// po restartu, kdy sdílení ještě není připojené) se připojí stejně.
+    /// Na Windows se `smb://server/share/cesta` převede na UNC cestu.
+    fn navigate_to_input(&mut self) -> Result<Option<PanelUiAction>, String> {
+        let input = self.path_input.trim().to_string();
+
+        if cfg!(windows) && input.to_ascii_lowercase().starts_with("smb://") {
+            let unc = format!("\\\\{}", input[6..].trim_matches('/').replace('/', "\\"));
+            self.path_input = unc;
+            return self.navigate_to_input();
+        }
+
+        if is_net_uri(&input) {
+            if let Some(t) = parse_net_target(&input) {
+                return Ok(Some(PanelUiAction::MountNetTarget(t)));
+            }
+            // Jen server (bez sdílení) - projdeme ho jako uzel v "Síti".
+            let (_, rest) = input.split_once("://").unwrap_or(("", ""));
+            let host = rest.trim_matches('/').rsplit('@').next().unwrap_or("").to_string();
+            if host.is_empty() {
+                return Err("Zadej adresu ve tvaru smb://server/sdílení".to_string());
+            }
+            let scheme = if input.to_ascii_lowercase().starts_with("nfs") { "nfs" } else { "smb" };
+            return Ok(Some(PanelUiAction::DrillNetwork {
+                uri: format!("{}://{}/", scheme, host),
+                name: host,
+            }));
+        }
+
+        let candidate = PathBuf::from(&input);
         if !candidate.exists() {
+            if cfg!(target_os = "linux") {
+                if let Some(t) = parse_net_target(&input) {
+                    return Ok(Some(PanelUiAction::MountNetTarget(t)));
+                }
+            }
             return Err(format!(
                 "Cesta neexistuje nebo není dostupná: {}",
                 candidate.display()
@@ -463,7 +500,7 @@ impl Panel {
         self.net_location = None;
         self.current_path = candidate;
         self.refresh();
-        Ok(())
+        Ok(None)
     }
 
     /// Plné cesty na disku k vybraným položkám (jen mimo archiv).
@@ -633,6 +670,9 @@ enum PanelUiAction {
     OpenBookmarks,
     MountNetworkShare { protocol: NetShareProtocol, server: String, share: String },
     DrillNetwork { uri: String, name: String },
+    /// Připojit sdílení zadané v adresním řádku (smb://..., nfs://...,
+    /// nepřipojená GVfs cesta) a skočit do něj, případně do podsložky.
+    MountNetTarget(NetTarget),
 }
 
 /// Akce z kontextového menu - vrací se z render_panel do update()
@@ -807,7 +847,10 @@ fn load_state() -> (Option<PathBuf>, Option<PathBuf>, Vec<Bookmark>,
 
     fn valid_path(s: &str) -> Option<PathBuf> {
         let p = PathBuf::from(s.trim());
-        if s.starts_with("\\\\") || p.is_dir() { Some(p) } else { None }
+        // Síťové cesty (GVfs mount bod, smb://, nfs://) necháváme i když
+        // teď neexistují - sdílení prostě není připojené (po restartu) a
+        // appka ho při skoku na záložku / po startu připojí sama.
+        if s.starts_with("\\\\") || p.is_dir() || parse_net_target(s).is_some() { Some(p) } else { None }
     }
     fn parse_sort_col(s: &str) -> Option<SortColumn> {
         match s.trim() {
@@ -1581,9 +1624,7 @@ struct Icons;
 
 impl Icons {
     // Emoji ikonky - fungují díky Segoe UI Emoji fontu načtenému v main()
-    fn folder()   -> &'static str { "\u{1F4C1}" }  // 📁 (dnes nepoužito - viz RowIcon)
-    fn file()     -> &'static str { "\u{1F4C4}" }  // 📄 (dnes nepoužito - viz RowIcon)
-    fn archive()  -> &'static str { "\u{1F4E6}" }  // 📦 (dnes nepoužito - viz RowIcon)
+    // (složka/soubor/archiv se kreslí jako PNG - viz RowIcon)
     fn up()       -> &'static str { "\u{2B06}"  }  // ⬆
     fn bookmark() -> &'static str { "\u{2605}"  }  // ★
 }
@@ -1627,6 +1668,49 @@ struct UpdateCheckResult {
 // fungují v souborovém dialogu i v Nautilus/Dolphin stejně). Windows
 // (WNetAddConnection2) zatím není implementováno.
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Označí celý obsah textového pole a dá mu fokus - pro Tab navigaci v
+/// dialozích (obsah jde rovnou přepsat, jako ve Windows dialozích).
+fn focus_select_all(ctx: &egui::Context, id: egui::Id, len: usize) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange {
+        primary:   egui::text::CCursor::new(0),
+        secondary: egui::text::CCursor::new(len),
+    }));
+    egui::TextEdit::store_state(ctx, id, state);
+    ctx.memory_mut(|m| m.request_focus(id));
+}
+
+/// Jednotná Tab / Shift+Tab navigace pro všechny dialogy.
+///
+/// Tab se v `update()` spotřebuje hned na začátku framu (jinak by ho
+/// egui použilo k přeskakování po všech widgetech v okně, včetně panelů
+/// za dialogem, a appka ho mimo dialogy používá pro přepnutí panelu).
+/// Když je otevřený dialog, směr se uloží do `dlg_tab` (+1 / -1) a každý
+/// dialog pak zavolá tuhle funkci se seznamem svých textových polí
+/// (id, délka textu) v pořadí, v jakém se mezi nimi má skákat.
+/// `button_stop` = v cyklu je i "zastávka" bez fokusu v poli, kde pak
+/// fungují šipky ←/→ pro výběr tlačítka (dialogy kopírování/ZIP).
+/// Textová pole dialogů mají `lock_focus(true)`, aby jim fokus nevzala
+/// vestavěná egui navigace.
+fn dialog_tab_nav(ctx: &egui::Context, dir: i8, fields: &[(egui::Id, usize)], button_stop: bool) {
+    if dir == 0 || fields.is_empty() { return; }
+    let focused = ctx.memory(|m| m.focused());
+    let n = fields.len() + usize::from(button_stop);
+    let cur = focused
+        .and_then(|f| fields.iter().position(|(id, _)| *id == f))
+        .unwrap_or(if button_stop { fields.len() } else if dir > 0 { n - 1 } else { 0 });
+    let next = if dir > 0 { (cur + 1) % n } else { (cur + n - 1) % n };
+    if next == fields.len() {
+        if let Some(f) = focused { ctx.memory_mut(|m| m.surrender_focus(f)); }
+        return;
+    }
+    focus_select_all(ctx, fields[next].0, fields[next].1);
+}
+
+/// Id textových polí dialogu "Připojit síťovou složku" v pořadí, v jakém
+/// mezi nimi skáče Tab: server, sdílení, doména, uživatel, heslo.
+const NET_FIELD_IDS: [&str; 5] = ["net_srv", "net_share", "net_dom", "net_user", "net_pwd"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetShareProtocol {
@@ -1675,15 +1759,29 @@ fn resolve_gvfs_mount_path(protocol: NetShareProtocol, server: &str, share: &str
         NetShareProtocol::Nfs => format!("server={},export=", server),
     };
 
+    // Porovnáváme bez ohledu na velikost písmen - GVfs jméno sdílení
+    // v názvu mount bodu převádí na malá písmena (smb://NAS/VIDEO ->
+    // "...,share=video"), takže přesná shoda by u "VIDEO" selhala.
+    let exact_prefix = exact_prefix.to_lowercase();
+    let server_l = server.to_lowercase();
+    let share_l  = share.to_lowercase();
+    // U NFS je export v názvu mountu escapovaný (%2F místo '/').
+    let share_esc = share_l.replace('/', "%2f");
+
     let mut fallback: Option<PathBuf> = None;
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&exact_prefix) {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let exact = match protocol {
+            // "share=video" nesmí chytit i "share=video2"
+            NetShareProtocol::Smb => name == exact_prefix || name.starts_with(&format!("{},", exact_prefix)),
+            NetShareProtocol::Nfs => name.starts_with(&exact_prefix),
+        };
+        if exact {
             return Some(entry.path());
         }
-        if name.contains(server) && name.contains(share) {
+        if name.contains(&server_l) && (name.contains(&share_l) || name.contains(&share_esc)) {
             fallback = Some(entry.path());
-        } else if fallback.is_none() && name.contains(server) {
+        } else if fallback.is_none() && name.contains(&server_l) {
             fallback = Some(entry.path());
         }
     }
@@ -1722,7 +1820,7 @@ fn rename_select_end(name: &str, select_ext: bool) -> usize {
 /// vrátí `None`, appka pak zavolá `gio list` na tomtéž URI o úroveň hlouběji).
 fn classify_net_uri(uri: &str) -> Option<(NetShareProtocol, String, String)> {
     let (scheme, rest) = uri.split_once("://")?;
-    let protocol = match scheme {
+    let protocol = match scheme.to_ascii_lowercase().as_str() {
         "smb" => NetShareProtocol::Smb,
         "nfs" => NetShareProtocol::Nfs,
         _ => return None,
@@ -1746,13 +1844,132 @@ fn classify_net_uri(uri: &str) -> Option<(NetShareProtocol, String, String)> {
     Some((protocol, server, share))
 }
 
+/// Síťový cíl rozpoznaný z textu - z adresního řádku (`smb://server/share/podsložka`),
+/// ze záložky nebo z uloženého stavu panelu (GVfs cesta typu
+/// `/run/user/1000/gvfs/smb-share:server=X,share=Y/podsložka`, která po
+/// restartu / odpojení neexistuje). Appka podle něj umí sdílení sama
+/// připojit a pak skočit rovnou do podsložky - bez ručního připojování předem.
+#[derive(Clone, Debug, PartialEq)]
+struct NetTarget {
+    protocol: NetShareProtocol,
+    server: String,
+    share: String,
+    /// Uživatelské jméno, pokud je v URI (`smb://user@server/share`) nebo
+    /// v názvu GVfs mountu (`...,user=jmeno`). Předvyplní se do dialogu.
+    user: String,
+    /// Relativní cesta uvnitř sdílení (bez úvodního '/'), prázdná = kořen.
+    subpath: String,
+}
+
+impl std::fmt::Debug for NetShareProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.scheme())
+    }
+}
+
+/// Jednoduché %XX dekódování (GVfs escapuje v názvech mountů např. '/'
+/// v NFS exportu jako %2F, mezery v URI jako %20 apod.).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Je text síťové URI (smb:// nebo nfs://, bez ohledu na velikost písmen)?
+fn is_net_uri(s: &str) -> bool {
+    let l = s.trim().to_ascii_lowercase();
+    l.starts_with("smb://") || l.starts_with("nfs://")
+}
+
+/// Rozpozná síťový cíl z textu - viz `NetTarget`. Podporované tvary:
+///   smb://[uživatel@]server[:port]/share[/podsložka...]
+///   nfs://server/export/cesta          (celá cesta se bere jako export)
+///   .../gvfs/smb-share:server=S,share=X[,user=U][,domain=D][/podsložka]
+///   .../gvfs/nfs:host=S,prefix=%2Fexport[/podsložka]   (tolerantně i server=/export=)
+/// Pro URI bez sdílení (jen `smb://server/`) vrací `None` - to je uzel
+/// k procházení, ne sdílení k připojení.
+fn parse_net_target(s: &str) -> Option<NetTarget> {
+    let s = s.trim();
+    if is_net_uri(s) {
+        let (scheme, rest) = s.split_once("://")?;
+        let protocol = if scheme.eq_ignore_ascii_case("smb") { NetShareProtocol::Smb } else { NetShareProtocol::Nfs };
+        let rest = rest.trim_matches('/');
+        let (authority, path) = match rest.split_once('/') {
+            Some((a, p)) => (a, p.trim_matches('/')),
+            None => (rest, ""),
+        };
+        let (user, host) = match authority.rsplit_once('@') {
+            Some((u, h)) => (percent_decode(u.split(';').last().unwrap_or(u)), h),
+            None => (String::new(), authority),
+        };
+        let mut server = host.to_string();
+        if protocol == NetShareProtocol::Smb {
+            if let Some(h) = server.strip_suffix(":445") { server = h.to_string(); }
+        }
+        if server.is_empty() || path.is_empty() { return None; }
+        let (share, subpath) = match protocol {
+            NetShareProtocol::Smb => match path.split_once('/') {
+                Some((sh, sub)) => (percent_decode(sh), percent_decode(sub.trim_matches('/'))),
+                None => (percent_decode(path), String::new()),
+            },
+            // U NFS nevíme, kde končí export a začíná podsložka - necháme
+            // celou cestu jako export, `gio mount` si s tím poradí.
+            NetShareProtocol::Nfs => (percent_decode(path), String::new()),
+        };
+        return Some(NetTarget { protocol, server, share, user, subpath });
+    }
+
+    // GVfs cesta k mount bodu (typicky z uložené záložky / stavu panelu).
+    let s = s.replace('\\', "/");
+    let idx = s.find("/gvfs/")?;
+    let after = &s[idx + "/gvfs/".len()..];
+    let (mount_name, subpath) = match after.split_once('/') {
+        Some((m, sub)) => (m, sub.trim_matches('/').to_string()),
+        None => (after, String::new()),
+    };
+    let (kind, params) = mount_name.split_once(':')?;
+    let mut server = String::new();
+    let mut share = String::new();
+    let mut user = String::new();
+    for kv in params.split(',') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        let v = percent_decode(v);
+        match k {
+            "server" | "host" => server = v,
+            "share" | "export" | "prefix" => share = v.trim_matches('/').to_string(),
+            "user" => user = v,
+            _ => {}
+        }
+    }
+    let protocol = match kind {
+        "smb-share" => NetShareProtocol::Smb,
+        k if k.starts_with("nfs") => NetShareProtocol::Nfs,
+        _ => return None,
+    };
+    if server.is_empty() || share.is_empty() { return None; }
+    Some(NetTarget { protocol, server, share, user, subpath })
+}
+
 /// Vytáhne z jednoho řádku výstupu `gio list -a standard::target-uri`
 /// dvojici (jméno položky, cílové URI). Přesný formát výstupu se může
 /// mezi verzemi GLib lišit (jeden řádek "jméno standard::target-uri=uri",
 /// nebo jméno a atribut na oddělených řádcích) - parser je proto záměrně
 /// tolerantní k oběma variantám a v nejhorším případě použije URI i jako
 /// zobrazované jméno, ať appka nezůstane bez výpisu úplně.
-fn parse_network_listing(text: &str) -> Vec<(String, String)> {
+fn parse_network_listing(text: &str, base_uri: &str) -> Vec<(String, String)> {
     // Ověřeno na reálném výstupu (nb-trubka-lx, gio list -a
     // standard::target-uri network:///):
     //   dnssd-server-NB-TRUBKA-LX._smb._tcp<TAB>0<TAB>(shortcut)<TAB>standard::target-uri=smb://host:445/
@@ -1777,6 +1994,16 @@ fn parse_network_listing(text: &str) -> Vec<(String, String)> {
                 value.clone()
             };
             result.push((nice_net_name(&name, &value), value));
+        } else if line.contains('\t') {
+            // Tabulkový řádek BEZ target-uri - takhle GVfs vypisuje sdílení
+            // na konkrétním SMB serveru (ověřeno na trubka-nb: `gio list
+            // smb://truenas.local/` vrací jen "VIDEO", "DOWNLOAD"). Cílové URI
+            // si pak složíme sami: <uri serveru>/<jméno sdílení>.
+            let name = line.split('\t').next().unwrap_or("").trim().to_string();
+            if !name.is_empty() && base_uri != "network:///" {
+                let uri = format!("{}/{}", base_uri.trim_end_matches('/'), name.replace(' ', "%20"));
+                result.push((name, uri));
+            }
         } else {
             pending_name = Some(line.trim().to_string());
         }
@@ -1824,7 +2051,7 @@ fn list_network_dir(uri: &str) -> Result<Vec<(String, String)>, String> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_network_listing(&text))
+    Ok(parse_network_listing(&text, uri))
 }
 
 /// Klasifikace interaktivního dotazu, který `gio mount` píše na stdout
@@ -1879,6 +2106,15 @@ fn run_gio_mount(url: &str, answers: [&str; 3]) -> Result<(), String> {
 
     let mut stdin  = child.stdin.take().ok_or("Nelze zapisovat do 'gio mount' (stdin).")?;
     let mut stdout = child.stdout.take().ok_or("Nelze číst výstup 'gio mount' (stdout).")?;
+    // stderr čteme souběžně (jinak by se chybová hláška gio ztratila
+    // a při větším výstupu by se proces mohl zablokovat na plné rouře).
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
 
     let (byte_tx, byte_rx) = std::sync::mpsc::channel::<Option<u8>>();
     thread::spawn(move || {
@@ -1892,24 +2128,42 @@ fn run_gio_mount(url: &str, answers: [&str; 3]) -> Result<(), String> {
         }
     });
 
-    let mut line = String::new();
+    // Bajty skládáme jako UTF-8 (české dotazy typu "Uživatel:" by se
+    // při převodu po jednotlivých bajtech rozsypaly).
+    let mut line_bytes: Vec<u8> = Vec::new();
     let timeout = std::time::Duration::from_secs(25);
+    // Kolikrát se gio zeptalo na heslo. Když odpověď neprojde, GVfs se
+    // ptá znovu a znovu - bez tohohle počítadla by appka zbytečně čekala
+    // celých 25 s na časový limit, než otevře dialog pro zadání hesla.
+    let mut password_prompts = 0u32;
 
     loop {
         match byte_rx.recv_timeout(timeout) {
             Ok(Some(b)) => {
-                let ch = b as char;
-                if ch == '\n' {
-                    line.clear();
+                if b == b'\n' {
+                    line_bytes.clear();
                     continue;
                 }
-                line.push(ch);
-                if line.ends_with(": ") {
+                line_bytes.push(b);
+                if line_bytes.ends_with(b": ") {
+                    let line = String::from_utf8_lossy(&line_bytes).to_string();
+                    line_bytes.clear();
                     let kind = classify_gio_prompt(&line);
+                    if kind == 2 {
+                        password_prompts += 1;
+                        if password_prompts > 1 {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(if answers[2].is_empty() {
+                                "Sdílení vyžaduje přihlášení - zadej jméno a heslo.".to_string()
+                            } else {
+                                "Přihlášení odmítnuto - zkontroluj jméno, doménu a heslo.".to_string()
+                            });
+                        }
+                    }
                     let answer = if kind == u8::MAX { "" } else { answers[kind as usize] };
                     let _ = writeln!(stdin, "{}", answer);
                     let _ = stdin.flush();
-                    line.clear();
                 }
             }
             Ok(None) => break, // gio mount skončilo / zavřelo stdout
@@ -1926,11 +2180,162 @@ fn run_gio_mount(url: &str, answers: [&str; 3]) -> Result<(), String> {
 
     drop(stdin);
     let status = child.wait().map_err(|e| format!("Čekání na 'gio mount': {}", e))?;
+    let stderr_text = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if status.success() {
         Ok(())
+    } else if !stderr_text.is_empty() {
+        Err(stderr_text)
     } else {
         Err(format!("gio mount skončilo chybou (exit {:?}).", status.code()))
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Uložená přihlášení k síťovým sdílením ("Zapamatovat heslo")
+//
+// Heslo nikdy nejde do souboru se stavem appky - ukládá se do systémové
+// klíčenky. Bez nových Rust závislostí, přes nástroje, které na Linuxu
+// bývají: nejdřív `secret-tool` (Secret Service API - GNOME Keyring, ale
+// i KWallet v Plasma 6), a když není / nefunguje, `kwallet-query` (KDE).
+// Klíč = "smb://server/sdílení" (malými písmeny), hodnota =
+// "uživatel<TAB>doména<TAB>heslo".
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Přeloží mDNS jméno ("nas.local") na IPv4 adresu - přes systémový
+/// resolver (`getent`, funguje s nss-mdns) a záložně přes Avahi
+/// (`avahi-resolve-host-name`). Jiná jména / když se nic nepovede
+/// vrací beze změny.
+fn resolve_mdns_host(server: &str) -> String {
+    let host = server.trim();
+    if !host.to_ascii_lowercase().ends_with(".local") {
+        return host.to_string();
+    }
+    let first_ip = |o: std::process::Output| -> Option<String> {
+        if !o.status.success() { return None; }
+        String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .find(|w| w.parse::<std::net::Ipv4Addr>().is_ok())
+            .map(|w| w.to_string())
+    };
+    run_cmd_timeout("getent", &["ahostsv4", host], None, 5)
+        .and_then(first_ip)
+        .or_else(|| run_cmd_timeout("avahi-resolve-host-name", &["-4", host], None, 5).and_then(first_ip))
+        .unwrap_or_else(|| host.to_string())
+}
+
+const SECRET_APP: &str = "er-commander";
+const KWALLET_FOLDER: &str = "eR Commander";
+
+/// Spustí příkaz s volitelným vstupem na stdin a časovým limitem (klíčenka
+/// se může ptát na odemčení - na to nechceme čekat donekonečna).
+fn run_cmd_timeout(prog: &str, args: &[&str], stdin_data: Option<&str>, secs: u64)
+    -> Option<std::process::Output>
+{
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(prog)
+        .args(args)
+        .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    if let Some(data) = stdin_data {
+        if let Some(mut si) = child.stdin.take() {
+            let _ = si.write_all(data.as_bytes());
+        } // drop = zavření stdin (EOF)
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()?.ok()
+}
+
+fn net_secret_key(protocol: NetShareProtocol, server: &str, share: &str) -> String {
+    format!("{}://{}/{}", protocol.scheme(), server.trim().to_lowercase(),
+        share.trim().trim_matches('/').to_lowercase())
+}
+
+/// Najde uložené přihlášení (uživatel, doména, heslo) pro dané sdílení.
+fn secret_lookup(key: &str) -> Option<(String, String, String)> {
+    if !cfg!(target_os = "linux") { return None; }
+    let ok_stdout = |o: std::process::Output| -> Option<String> {
+        if !o.status.success() { return None; }
+        let t = String::from_utf8_lossy(&o.stdout).trim_end_matches(['\n', '\r']).to_string();
+        if t.is_empty() { None } else { Some(t) }
+    };
+    let raw = run_cmd_timeout("secret-tool",
+            &["lookup", "application", SECRET_APP, "share", key], None, 60)
+        .and_then(ok_stdout)
+        .or_else(|| run_cmd_timeout("kwallet-query",
+            &["-f", KWALLET_FOLDER, "-r", key, "kdewallet"], None, 60)
+            .and_then(ok_stdout))?;
+    let mut it = raw.splitn(3, '\t');
+    let user = it.next()?.to_string();
+    let domain = it.next()?.to_string();
+    let password = it.next()?.to_string();
+    if password.is_empty() { None } else { Some((user, domain, password)) }
+}
+
+/// Uloží přihlášení do klíčenky (přepíše případné starší).
+fn secret_store(key: &str, user: &str, domain: &str, password: &str) -> Result<(), String> {
+    if !cfg!(target_os = "linux") { return Ok(()); }
+    let value = format!("{}\t{}\t{}", user, domain, password);
+    let label = format!("eR Commander: {}", key);
+    let st = run_cmd_timeout("secret-tool",
+        &["store", "--label", &label, "application", SECRET_APP, "share", key],
+        Some(&value), 60);
+    if matches!(&st, Some(o) if o.status.success()) { return Ok(()); }
+    let kw = run_cmd_timeout("kwallet-query",
+        &["-f", KWALLET_FOLDER, "-w", key, "kdewallet"], Some(&value), 60);
+    if matches!(&kw, Some(o) if o.status.success()) { return Ok(()); }
+    let detail = |o: &Option<std::process::Output>, name: &str| match o {
+        None => format!("{}: nenalezen / nereaguje", name),
+        Some(o) => format!("{}: {}", name, String::from_utf8_lossy(&o.stderr).trim()),
+    };
+    Err(format!("Heslo se nepodařilo uložit do klíčenky ({}; {}).",
+        detail(&st, "secret-tool"), detail(&kw, "kwallet-query")))
+}
+
+/// Připojení sdílení včetně práce s klíčenkou: když nemáme heslo (automatické
+/// připojení ze záložky / po startu / z "Sítě"), zkusí se uložené; po
+/// úspěšném připojení s ručně zadaným heslem a zaškrtnutým "Zapamatovat"
+/// se heslo uloží. Vrací cestu k mount bodu + případné varování (uložení
+/// hesla selhalo - připojení samo ale proběhlo).
+fn net_mount_job(
+    protocol: NetShareProtocol,
+    server: String,
+    share: String,
+    domain: String,
+    user: String,
+    password: String,
+    anonymous: bool,
+    remember: bool,
+) -> Result<(PathBuf, Option<String>), String> {
+    let key = net_secret_key(protocol, &server, &share);
+    let (mut domain, mut user, mut password) = (domain, user, password);
+    let mut from_store = false;
+    if protocol == NetShareProtocol::Smb && !anonymous && password.is_empty() {
+        if let Some((u, d, p)) = secret_lookup(&key) {
+            if user.trim().is_empty() || user.trim() == u {
+                user = u;
+                if !d.is_empty() { domain = d; }
+                password = p;
+                from_store = true;
+            }
+        }
+    }
+    let path = gio_mount_worker(protocol, server, share, domain.clone(), user.clone(), password.clone(), anonymous)?;
+    let mut warning = None;
+    if protocol == NetShareProtocol::Smb && remember && !anonymous && !password.is_empty() && !from_store {
+        if let Err(e) = secret_store(&key, &user, &domain, &password) {
+            warning = Some(e);
+        }
+    }
+    Ok((path, warning))
 }
 
 fn gio_mount_worker(
@@ -1952,12 +2357,25 @@ fn gio_mount_worker(
         return Err("Zadej server i sdílenou složku.".to_string());
     }
 
+    // NFS backend GVfs (libnfs) si jméno serveru překládá sám a mDNS
+    // jména "*.local" neumí - ověřeno na trubka-nb: nfs://truenas.local/...
+    // hlásí "Bod připojení neexistuje", nfs://192.168.1.2/... projde.
+    // (SMB .local zvládá, proto jen u NFS.) Přeložíme ho tedy sami.
+    let server = if protocol == NetShareProtocol::Nfs { resolve_mdns_host(&server) } else { server };
+
     let url = format!("{}://{}/{}", protocol.scheme(), server, share);
     let answers: [&str; 3] = if anonymous { ["", "", ""] } else { [&user, &domain, &password] };
     let mount_result = run_gio_mount(&url, answers);
 
+    // Z výpisu `gio mount -l` jen síťová připojení (řádky s "://") -
+    // lokální disky (UDisks2) sem nepatří a jen zahlcovaly chybovou hlášku.
     let listing = std::process::Command::new("gio").arg("mount").arg("-l").output().ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| l.contains("://"))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"))
         .unwrap_or_default();
 
     if let Err(e) = mount_result {
@@ -1967,16 +2385,25 @@ fn gio_mount_worker(
         if let Some(path) = resolve_gvfs_mount_path(protocol, &server, &share) {
             return Ok(path);
         }
-        return Err(format!(
-            "{}\n\nAktuálně připojené síťové složky (gio mount -l):\n{}", e, listing
-        ));
+        // GVfs bez NFS backendu (na některých distribucích samostatný
+        // balíček) hlásí jen nic neříkající chybu - poradíme, co chybí.
+        if protocol == NetShareProtocol::Nfs
+            && !std::path::Path::new("/usr/share/gvfs/mounts/nfs.mount").exists()
+        {
+            return Err(format!(
+                "{}\n\nGVfs nemá podporu NFS (chybí /usr/share/gvfs/mounts/nfs.mount) - \
+                 doinstaluj NFS backend GVfs, např. `sudo zypper in gvfs-backend-nfs` / `apt install gvfs-backends`.",
+                e
+            ));
+        }
+        return Err(e);
     }
 
     match resolve_gvfs_mount_path(protocol, &server, &share) {
         Some(path) => Ok(path),
         None => Err(format!(
-            "Připojení proběhlo, ale nepodařilo se najít lokální cestu k mount bodu.\n\nAktuálně připojené síťové složky (gio mount -l):\n{}",
-            listing
+            "Připojení proběhlo, ale nepodařilo se najít lokální cestu k mount bodu.\n\nPřipojená síťová umístění (gio mount -l):\n{}",
+            if listing.is_empty() { "(žádná)".to_string() } else { listing }
         )),
     }
 }
@@ -1992,10 +2419,22 @@ fn gio_browse_worker(uri: String) -> Result<Vec<(String, String)>, String> {
     if !cfg!(target_os = "linux") {
         return Err("Procházení sítě je zatím implementováno jen pro Linux (GVfs/gio).".to_string());
     }
-    if uri != "network:///" {
-        let _ = run_gio_mount(&uri, ["", "", ""]);
-    }
-    list_network_dir(&uri)
+    // "smb://host:445/" (tak ho hlásí mDNS) -> "smb://host/" - ověřeno, že
+    // bez portu `gio list smb://truenas.local/` spolehlivě vrací sdílení.
+    let uri = if uri.to_ascii_lowercase().starts_with("smb://") {
+        uri.replacen(":445/", "/", 1)
+    } else {
+        uri
+    };
+    let mount_err = if uri != "network:///" {
+        run_gio_mount(&uri, ["", "", ""]).err()
+    } else {
+        None
+    };
+    list_network_dir(&uri).map_err(|list_err| match mount_err {
+        Some(m) => format!("{}\n(gio mount {}: {})", list_err, uri, m),
+        None => list_err,
+    })
 }
 
 /// Zjistí nejnovější GitHub Release repozitáře a najde v jeho assetech
@@ -2225,10 +2664,35 @@ struct FileManagerApp {
     net_anonymous: bool,
     net_mount_busy: bool,
     net_mount_error: Option<String>,
-    net_mount_rx: Option<Receiver<Result<PathBuf, String>>>,
+    net_mount_rx: Option<Receiver<Result<(PathBuf, Option<String>), String>>>,
+    /// "Zapamatovat heslo" v dialogu připojení (uloží se do klíčenky).
+    net_remember: bool,
     /// True, když připojení odstartoval dvojklik v "Síti" (ne ruční dialog) -
     /// při chybě pak dialog otevřeme předvyplněný, ať uživatel doplní údaje.
     net_mount_from_browse: bool,
+    /// Podsložka uvnitř sdílení, kam se po úspěšném připojení skočí
+    /// (z adresního řádku `smb://server/share/podsložka` nebo ze záložky).
+    net_mount_subpath: String,
+    /// Zda po připojení aktivovat cílový panel (u dvojité záložky se
+    /// neaktivní panel připojuje "potichu", aktivní zůstává ten z hvězdičky).
+    net_mount_focus: bool,
+    /// Další čekající připojení (dvojitá záložka, obnovení obou panelů po
+    /// startu) - GVfs mount běží vždy jen jeden najednou.
+    net_mount_queue: std::collections::VecDeque<(ActivePanel, NetTarget, bool)>,
+    /// Které pole dialogu připojení má dostat fokus při dalším vykreslení
+    /// (index do NET_FIELD_IDS) - nastavuje se při otevření dialogu.
+    net_focus_field: Option<usize>,
+    /// Tab (+1) / Shift+Tab (-1) stisknutý v tomto framu, když je otevřený
+    /// dialog - viz `dialog_tab_nav`.
+    dlg_tab: i8,
+    /// Po kliknutí na ✏ u záložky: dát fokus poli s názvem, jakmile se vykreslí.
+    bm_focus_pending: bool,
+
+    // Dialog "Odpojit síťovou složku" - výběr z aktuálně připojených GVfs
+    // sdílení (zobrazený název, kořen mount bodu), `unmount_sel` = vybraný řádek.
+    show_unmount_dialog: bool,
+    unmount_list: Vec<(String, PathBuf)>,
+    unmount_sel: usize,
 
     // Procházení sítě o úroveň hlouběji (drill) - viz `NetActivation::Drill`.
     // Běží na pozadí, protože je potřeba nejdřív "připojit" uzel
@@ -2245,8 +2709,18 @@ impl Default for FileManagerApp {
         let home = dirs_home();
         let (saved_left, saved_right, bookmarks,
              sort_l_col, sort_l_dir, sort_r_col, sort_r_dir, saved_dark_mode) = load_state();
-        let left_path  = saved_left.unwrap_or_else(|| home.clone());
-        let right_path = saved_right.unwrap_or_else(|| home.clone());
+        // Panel byl při ukončení na síťovém sdílení, které teď není
+        // připojené (typicky po restartu) - panel zatím otevřeme v domovské
+        // složce a sdílení hned po startu připojíme na pozadí (viz níže).
+        let net_startup = |p: &Option<PathBuf>| -> Option<NetTarget> {
+            let p = p.as_ref()?;
+            if !cfg!(target_os = "linux") || p.is_dir() { return None; }
+            parse_net_target(&p.to_string_lossy())
+        };
+        let startup_left_net  = net_startup(&saved_left);
+        let startup_right_net = net_startup(&saved_right);
+        let left_path  = if startup_left_net.is_some()  { home.clone() } else { saved_left.unwrap_or_else(|| home.clone()) };
+        let right_path = if startup_right_net.is_some() { home.clone() } else { saved_right.unwrap_or_else(|| home.clone()) };
         let mut left_panel  = Panel::new(left_path.clone());
         let mut right_panel = Panel::new(right_path.clone());
         if let Some(c) = sort_l_col { left_panel.sort_col  = c; left_panel.refresh(); }
@@ -2283,7 +2757,7 @@ impl Default for FileManagerApp {
             right_panel.refresh();
         }
 
-        Self {
+        let mut app = Self {
             left: left_panel,
             right: right_panel,
             active: ActivePanel::Left,
@@ -2424,13 +2898,27 @@ impl Default for FileManagerApp {
             net_mount_busy: false,
             net_mount_error: None,
             net_mount_rx: None,
+            net_remember: true,
             net_mount_from_browse: false,
+            net_mount_subpath: String::new(),
+            net_mount_focus: true,
+            net_mount_queue: std::collections::VecDeque::new(),
+            net_focus_field: None,
+            dlg_tab: 0,
+            bm_focus_pending: false,
+            show_unmount_dialog: false,
+            unmount_list: Vec::new(),
+            unmount_sel: 0,
             net_browse_busy: false,
             net_browse_target: ActivePanel::Left,
             net_browse_uri: String::new(),
             net_browse_name: String::new(),
             net_browse_rx: None,
-        }
+        };
+        // Neaktivní panel připojíme bez přepnutí fokusu, levý (výchozí aktivní) s ním.
+        if let Some(t) = startup_right_net { app.start_target_mount(ActivePanel::Right, t, false); }
+        if let Some(t) = startup_left_net  { app.start_target_mount(ActivePanel::Left,  t, false); }
+        app
     }
 }
 
@@ -2894,6 +3382,32 @@ impl FileManagerApp {
         let _ = fs::write(path, content);
     }
 
+    /// Je otevřený nějaký dialog, který si klávesnici řeší sám? Pak panely
+    /// nesmí dostat Tab, šipky, mezerník, Enter, Delete, F-klávesy ani +/-.
+    /// (Průběh kopírování sem záměrně nepatří - při něm jde s panely dál
+    /// pracovat.) Nový dialog = přidat ho SEM, jinde nic.
+    fn modal_dialog_open(&self) -> bool {
+        self.show_delete_confirm
+            || self.show_copy_confirm
+            || self.show_zip_confirm
+            || self.show_rename_dialog
+            || self.pending_action.is_some()
+            || self.op_err_wait.is_some()
+            || self.show_search
+            || self.show_hash_dialog
+            || self.show_about
+            || self.show_settings
+            || self.show_update_dialog
+            || self.show_bookmarks
+            || self.show_rename_single
+            || self.show_select_mask
+            || self.show_new_dir
+            || self.show_new_file
+            || self.show_text_editor
+            || self.show_net_mount
+            || self.show_unmount_dialog
+    }
+
     /// Otevře dialog záložek. `target` říká, do kterého panelu se má
     /// vybraná záložka skočit (ten, ze kterého se dialog otevřel hvězdičkou).
     fn open_bookmarks(&mut self, target: ActivePanel) {
@@ -2939,32 +3453,38 @@ impl FileManagerApp {
     fn jump_to_bookmark(&mut self, bm: &Bookmark) {
         // bm.left = aktivní panel (ze kterého se kliklo na hvězdičku)
         // bm.right = neaktivní panel
-        match self.bookmarks_target {
-            ActivePanel::Left => {
-                // Kliklo se na hvězdičku v levém panelu
-                self.left.archive_location = None;
-                self.left.current_path = bm.left.clone();
-                self.left.refresh();
-                if let Some(ref inactive) = bm.right {
-                    self.right.archive_location = None;
-                    self.right.current_path = inactive.clone();
-                    self.right.refresh();
-                }
-                self.active = ActivePanel::Left;
-            }
-            ActivePanel::Right => {
-                // Kliklo se na hvězdičku v pravém panelu
-                self.right.archive_location = None;
-                self.right.current_path = bm.left.clone();
-                self.right.refresh();
-                if let Some(ref inactive) = bm.right {
-                    self.left.archive_location = None;
-                    self.left.current_path = inactive.clone();
-                    self.left.refresh();
-                }
-                self.active = ActivePanel::Right;
+        let (act, inact) = match self.bookmarks_target {
+            ActivePanel::Left  => (ActivePanel::Left,  ActivePanel::Right),
+            ActivePanel::Right => (ActivePanel::Right, ActivePanel::Left),
+        };
+        self.active = act;
+        // Aktivní panel první - pokud je potřeba připojovat oba, jeho
+        // připojení (a případný dialog s heslem) přijde na řadu dřív.
+        self.goto_path_in_panel(act, bm.left.clone(), true);
+        if let Some(ref inactive) = bm.right {
+            self.goto_path_in_panel(inact, inactive.clone(), false);
+        }
+    }
+
+    /// Nastaví panel na danou cestu. Když cesta neexistuje, ale jde o
+    /// síťové sdílení (nepřipojený GVfs mount bod ze záložky, smb://,
+    /// nfs://), sdílení se nejdřív automaticky připojí - uživatel nemusí
+    /// nic připojovat předem.
+    fn goto_path_in_panel(&mut self, which: ActivePanel, path: PathBuf, focus: bool) {
+        if cfg!(target_os = "linux") && !path.is_dir() {
+            if let Some(t) = parse_net_target(&path.to_string_lossy()) {
+                self.start_target_mount(which, t, focus);
+                return;
             }
         }
+        let panel = match which {
+            ActivePanel::Left  => &mut self.left,
+            ActivePanel::Right => &mut self.right,
+        };
+        panel.archive_location = None;
+        panel.net_location = None;
+        panel.current_path = path;
+        panel.refresh();
     }
 
     fn request_delete(&mut self) {
@@ -3377,11 +3897,17 @@ impl eframe::App for FileManagerApp {
             ctx.memory_mut(|m| m.request_focus(editor_id));
         }
 
+        self.dlg_tab = 0;
         if !self.show_text_editor {
-            let tab_pressed = ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
-            });
-            if tab_pressed {
+            let (tab_pressed, shift_tab) = ctx.input_mut(|i| (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
+                i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab),
+            ));
+            if self.modal_dialog_open() {
+                // V dialogu Tab jen přechází mezi jeho poli (dialog_tab_nav),
+                // nikdy nepřepíná panely.
+                self.dlg_tab = if tab_pressed { 1 } else if shift_tab { -1 } else { 0 };
+            } else if tab_pressed {
                 self.active = match self.active {
                     ActivePanel::Left  => ActivePanel::Right,
                     ActivePanel::Right => ActivePanel::Left,
@@ -3414,6 +3940,7 @@ impl eframe::App for FileManagerApp {
             || self.show_zip_confirm
             || self.show_progress
             || self.show_net_mount
+            || self.show_unmount_dialog
             || self.pending_action.is_some()
             || self.left.inline_rename_idx.is_some()
             || self.right.inline_rename_idx.is_some();
@@ -3575,6 +4102,10 @@ impl eframe::App for FileManagerApp {
                         self.active = ActivePanel::Left;
                         self.start_network_drill(uri, name);
                     }
+                    Some(PanelUiAction::MountNetTarget(t)) => {
+                        self.active = ActivePanel::Left;
+                        self.start_target_mount(ActivePanel::Left, t, true);
+                    }
                     None => {}
                 }
                 match right_action {
@@ -3586,6 +4117,10 @@ impl eframe::App for FileManagerApp {
                     Some(PanelUiAction::DrillNetwork { uri, name }) => {
                         self.active = ActivePanel::Right;
                         self.start_network_drill(uri, name);
+                    }
+                    Some(PanelUiAction::MountNetTarget(t)) => {
+                        self.active = ActivePanel::Right;
+                        self.start_target_mount(ActivePanel::Right, t, true);
                     }
                     None => {}
                 }
@@ -3662,6 +4197,7 @@ impl eframe::App for FileManagerApp {
         self.render_update_dialog(ctx);
         self.poll_net_mount();
         self.render_net_mount_dialog(ctx);
+        self.render_unmount_dialog(ctx);
         self.poll_net_browse();
 
         // Barevné téma
@@ -3831,7 +4367,11 @@ impl FileManagerApp {
             if esc   { self.show_new_file = false; self.new_file_error = None; }
         } else if self.show_bookmarks {
             let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-            if esc { self.show_bookmarks = false; }
+            if esc {
+                // Esc při úpravě záložky jen zruší úpravu, dialog nechá otevřený.
+                if self.bm_edit_idx.is_some() { self.bm_edit_idx = None; }
+                else { self.show_bookmarks = false; }
+            }
         } else if self.show_hash_dialog {
             let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             if esc {
@@ -3844,10 +4384,7 @@ impl FileManagerApp {
         // ── Navigační klávesy - spotřebuj VŽDY ──────────────────────────
         // Tím zabráníme egui widget-navigation (Tab/šipky po tlačítkách).
         // Enter spotřebujeme jen pokud není otevřený žádný dialog s textovým polem.
-        let any_text_dialog = self.show_rename_single || self.show_select_mask
-            || self.show_rename_dialog || self.show_search
-            || self.show_new_dir || self.show_new_file
-            || self.show_text_editor
+        let any_text_dialog = self.modal_dialog_open()
             || self.left.inline_rename_idx.is_some()
             || self.right.inline_rename_idx.is_some();
 
@@ -3914,16 +4451,16 @@ impl FileManagerApp {
             || self.show_new_file
             || self.show_text_editor
             || self.show_net_mount
+            || self.show_unmount_dialog
             || (self.show_progress && self.op_rx.is_some());
 
         // F klávesy blokují POUZE dialogy které samy pracují s klávesnicí
         // (textová pole apod.). Progress dialog F klávesy NEBLOKUJE nikdy.
         let fkeys_blocked = editing_path
-            || self.show_rename_dialog
-            || self.pending_action.is_some()
-            || self.show_search
-            || self.show_hash_dialog
-            || self.show_rename_single
+            || self.modal_dialog_open()
+            // Jakékoliv textové pole s fokusem (název záložky apod.) -
+            // "+"/"-" a F-klávesy patří do něj, ne panelu.
+            || ctx.wants_keyboard_input()
             || self.active_panel().net_location.is_some()
             || self.left.inline_rename_idx.is_some()
             || self.right.inline_rename_idx.is_some();
@@ -4068,6 +4605,8 @@ impl FileManagerApp {
 
     fn render_zip_confirm_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_zip_confirm { return; }
+        // Tab: pole s názvem <-> tlačítka (tam fungují šipky ←/→)
+        dialog_tab_nav(ctx, self.dlg_tab, &[(egui::Id::new("zip_name_field"), self.zip_pack_name.chars().count())], true);
         let mut do_pack = false; let mut do_cancel = false;
         let count = self.zip_pack_files.len();
         egui::Window::new(format!("📦 Zabalit {} položek do ZIP", count))
@@ -4085,6 +4624,7 @@ impl FileManagerApp {
                 ui.separator();
                 ui.label("Název ZIP souboru:");
                 ui.add(egui::TextEdit::singleline(&mut self.zip_pack_name)
+                    .lock_focus(true)
                     .desired_width(f32::INFINITY).id(egui::Id::new("zip_name_field")));
                 ui.label(egui::RichText::new("← → šipky volí  |  Enter potvrdí  |  Esc zruší")
                     .small().color(egui::Color32::GRAY));
@@ -4106,6 +4646,10 @@ impl FileManagerApp {
 
     fn render_copy_confirm_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_copy_confirm { return; }
+        if self.copy_targets.len() == 1 {
+            // Tab: pole s názvem v cíli <-> tlačítka (tam fungují šipky ←/→)
+            dialog_tab_nav(ctx, self.dlg_tab, &[(egui::Id::new("copy_rename_field"), self.copy_new_name.chars().count())], true);
+        }
         let kind_label = if self.copy_move_kind == OpKind::Copy { "Kopírovat" } else { "Přesunout" };
         let title = format!("{} {} položek?", kind_label, self.copy_targets.len());
         let mut do_confirm = false;
@@ -4135,6 +4679,7 @@ impl FileManagerApp {
                     ui.label("Název v cíli (můžeš přejmenovat):");
                     ui.add(egui::TextEdit::singleline(&mut self.copy_new_name)
                         .id(egui::Id::new("copy_rename_field"))
+                        .lock_focus(true)
                         .desired_width(f32::INFINITY));
                 }
                 ui.separator();
@@ -4164,6 +4709,11 @@ impl FileManagerApp {
         if !self.show_rename_dialog {
             return;
         }
+        dialog_tab_nav(ctx, self.dlg_tab, &[
+            (egui::Id::new("ren_mask"), self.rename_mask.chars().count()),
+            (egui::Id::new("ren_find"), self.rename_pattern.chars().count()),
+            (egui::Id::new("ren_repl"), self.rename_replacement.chars().count()),
+        ], false);
         egui::Window::new("Hromadné přejmenování")
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -4171,6 +4721,8 @@ impl FileManagerApp {
                 ui.label("Maska nového názvu (nepovinné):");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.rename_mask)
+                        .id(egui::Id::new("ren_mask"))
+                        .lock_focus(true)
                         .hint_text("např. [N]_[C].[E]")
                         .desired_width(220.0));
                     if ui.button("[N]").on_hover_text("Vložit token: název bez přípony").clicked() {
@@ -4196,9 +4748,11 @@ impl FileManagerApp {
                 ui.separator();
 
                 ui.label("Najít:");
-                ui.text_edit_singleline(&mut self.rename_pattern);
+                ui.add(egui::TextEdit::singleline(&mut self.rename_pattern)
+                    .id(egui::Id::new("ren_find")).lock_focus(true));
                 ui.label("Nahradit za:");
-                ui.text_edit_singleline(&mut self.rename_replacement);
+                ui.add(egui::TextEdit::singleline(&mut self.rename_replacement)
+                    .id(egui::Id::new("ren_repl")).lock_focus(true));
                 ui.checkbox(&mut self.rename_use_regex, "Použít regulární výraz");
 
                 ui.horizontal(|ui| {
@@ -4346,7 +4900,7 @@ impl FileManagerApp {
                         cmd!("Nový soubor",           "Ctrl+N",  { self.new_file_name = "novy_soubor.txt".to_string(); self.new_file_error = None; self.show_new_file = true; });
                         ui.separator(); ui.separator(); ui.end_row();
                         cmd!("Připojit síťovou složku (SMB/NFS)", "", self.open_net_mount_dialog());
-                        cmd!("Odpojit síťovou složku",            "", self.unmount_active_net_share());
+                        cmd!("Odpojit síťovou složku",            "", self.open_unmount_dialog());
                         ui.separator(); ui.separator(); ui.end_row();
                         cmd!("Přepnout panel",        "Tab",     { self.active = match self.active { ActivePanel::Left => ActivePanel::Right, ActivePanel::Right => ActivePanel::Left }; });
                     });
@@ -4450,6 +5004,11 @@ impl FileManagerApp {
         if !self.show_search {
             return;
         }
+        dialog_tab_nav(ctx, self.dlg_tab, &[
+            (egui::Id::new("search_root"), self.search_root.to_string_lossy().chars().count()),
+            (egui::Id::new("search_name"), self.search_name.chars().count()),
+            (egui::Id::new("search_content"), self.search_content.chars().count()),
+        ], false);
         let mut open = true;
         let mut jump_to: Option<PathBuf> = None;
 
@@ -4460,16 +5019,19 @@ impl FileManagerApp {
             .show(ctx, |ui| {
                 ui.label("Prohledávaný adresář:");
                 let mut root_str = self.search_root.to_string_lossy().into_owned();
-                if ui.text_edit_singleline(&mut root_str).changed() {
+                if ui.add(egui::TextEdit::singleline(&mut root_str)
+                    .id(egui::Id::new("search_root")).lock_focus(true)).changed() {
                     self.search_root = PathBuf::from(root_str);
                 }
 
                 ui.add_space(4.0);
                 ui.label("Název souboru obsahuje:");
-                ui.text_edit_singleline(&mut self.search_name);
+                ui.add(egui::TextEdit::singleline(&mut self.search_name)
+                    .id(egui::Id::new("search_name")).lock_focus(true));
 
                 ui.label("Text uvnitř souboru (volitelné, pomalejší):");
-                ui.text_edit_singleline(&mut self.search_content);
+                ui.add(egui::TextEdit::singleline(&mut self.search_content)
+                    .id(egui::Id::new("search_content")).lock_focus(true));
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -4508,6 +5070,7 @@ impl FileManagerApp {
     /// logo, přidej sem nahoru např. `ui.image(...)` s načteným obrázkem.
     fn render_settings_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_settings { return; }
+        dialog_tab_nav(ctx, self.dlg_tab, &[(egui::Id::new("settings_editor"), self.external_editor.chars().count())], true);
         let mut changed = false;
 
         egui::Window::new("⚙ Nastavení")
@@ -4592,6 +5155,8 @@ impl FileManagerApp {
                     ui.label("Cesta k exe souboru editoru:");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.external_editor)
+                            .id(egui::Id::new("settings_editor"))
+                            .lock_focus(true)
                             .desired_width(280.0)
                             .hint_text("např. C:\\Program Files\\Notepad++\\notepad++.exe"));
                         if ui.button("📂").on_hover_text("Vybrat exe soubor").clicked() {
@@ -4732,6 +5297,13 @@ impl FileManagerApp {
     /// aktuální složky, přechod na uloženou, odebrání.
     fn render_bookmarks_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_bookmarks { return; }
+        if self.bm_edit_idx.is_some() {
+            dialog_tab_nav(ctx, self.dlg_tab, &[
+                (egui::Id::new("bm_name"), self.bm_edit_name.chars().count()),
+                (egui::Id::new("bm_left"), self.bm_edit_left.chars().count()),
+                (egui::Id::new("bm_right"), self.bm_edit_right.chars().count()),
+            ], false);
+        }
         let mut open       = true;
         let mut jump_idx:   Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
@@ -4775,12 +5347,18 @@ impl FileManagerApp {
                                 ui.label(egui::RichText::new("Upravit záložku").strong());
                                 ui.horizontal(|ui| {
                                     ui.label("Název:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.bm_edit_name)
+                                    let name_resp = ui.add(egui::TextEdit::singleline(&mut self.bm_edit_name)
+                                        .id(egui::Id::new("bm_name")).lock_focus(true)
                                         .desired_width(300.0));
+                                    if self.bm_focus_pending {
+                                        self.bm_focus_pending = false;
+                                        focus_select_all(ui.ctx(), name_resp.id, self.bm_edit_name.chars().count());
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("A:"); // Aktivní
                                     ui.add(egui::TextEdit::singleline(&mut self.bm_edit_left)
+                                        .id(egui::Id::new("bm_left")).lock_focus(true)
                                         .desired_width(360.0));
                                     if ui.small_button("◎").on_hover_text("Použít aktuální aktivní panel").clicked() {
                                         self.bm_edit_left = match self.bookmarks_target {
@@ -4792,6 +5370,7 @@ impl FileManagerApp {
                                 ui.horizontal(|ui| {
                                     ui.label("N:"); // Neaktivní
                                     ui.add(egui::TextEdit::singleline(&mut self.bm_edit_right)
+                                        .id(egui::Id::new("bm_right")).lock_focus(true)
                                         .desired_width(360.0));
                                     if ui.small_button("◎").on_hover_text("Použít aktuální neaktivní panel").clicked() {
                                         self.bm_edit_right = match self.bookmarks_target {
@@ -4845,9 +5424,11 @@ impl FileManagerApp {
                     }
                 });
 
-                // Enter pro přejití na první záložku pokud nic není editováno
-                if self.bm_edit_idx.is_none() {
-                    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !self.bookmarks.is_empty() {
+                // Enter: při úpravě záložky = Uložit, jinak skok na první záložku
+                if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if self.bm_edit_idx.is_some() {
+                        save_edit = true;
+                    } else if !self.bookmarks.is_empty() {
                         jump_idx = Some(0);
                     }
                 }
@@ -4862,6 +5443,11 @@ impl FileManagerApp {
             self.bm_edit_name  = bm.name.clone();
             self.bm_edit_left  = bm.left.display().to_string();
             self.bm_edit_right = bm.right.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+            // Rovnou do pole s názvem, celý označený k přepsání - ale až
+            // v dalším framu, kdy pole opravdu existuje. Fokus na widget,
+            // který v daném framu nebyl vykreslený, shodí accesskit
+            // (panic "self.nodes.contains_key(&self.focus)", KDE/AT-SPI).
+            self.bm_focus_pending = true;
         }
 
         if save_edit {
@@ -4919,6 +5505,7 @@ impl FileManagerApp {
                 ui.label(format!("Přejmenovat: {}", self.rename_single_old));
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.rename_single_new)
+                        .lock_focus(true)
                         .desired_width(300.0)
                         .id_source("rename_single_input"),
                 );
@@ -4990,6 +5577,7 @@ impl FileManagerApp {
                 ui.label("Maska (např. *.mkv, film*, *.mp?):");
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.select_mask)
+                        .lock_focus(true)
                         .desired_width(280.0)
                         .id_source("select_mask_input"),
                 );
@@ -5086,6 +5674,7 @@ impl FileManagerApp {
                 ui.label("Název nové složky:");
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.new_dir_name)
+                        .lock_focus(true)
                         .desired_width(280.0)
                         .id_source("new_dir_input"),
                 );
@@ -5116,6 +5705,7 @@ impl FileManagerApp {
                 ui.label("Název souboru:");
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.new_file_name)
+                        .lock_focus(true)
                         .desired_width(280.0)
                         .id_source("new_file_input"),
                 );
@@ -5139,9 +5729,13 @@ impl FileManagerApp {
     /// (kam appka po úspěšném připojení naviguje) je ten, který byl
     /// aktivní v okamžiku otevření dialogu.
     fn open_net_mount_dialog(&mut self) {
+        if self.net_domain.trim().is_empty() { self.net_domain = "WORKGROUP".to_string(); }
+        self.net_focus_field = Some(0);
         self.net_mount_target = self.active;
         self.net_mount_error = None;
         self.net_mount_from_browse = false;
+        self.net_mount_subpath.clear();
+        self.net_mount_focus = true;
         self.show_net_mount = true;
     }
 
@@ -5154,25 +5748,74 @@ impl FileManagerApp {
         self.net_protocol = protocol;
         self.net_server = server;
         self.net_share = share;
-        self.net_domain.clear();
+        self.net_domain = "WORKGROUP".to_string();
         self.net_user.clear();
         self.net_password.clear();
         self.net_anonymous = false;
         self.net_mount_target = self.active;
         self.net_mount_from_browse = true;
+        self.net_mount_subpath.clear();
+        self.net_mount_focus = true;
         self.net_mount_error = None;
+        self.op_status = Some(StatusMsg::Info(format!(
+            "Připojuji {}://{}/{} …", self.net_protocol.scheme(), self.net_server, self.net_share
+        )));
         self.start_net_mount();
+    }
+
+    /// Připojí sdílení z adresního řádku / záložky / uloženého stavu
+    /// (`NetTarget`) a po úspěchu skočí do cílového panelu, případně do
+    /// podsložky. Zkouší se nejdřív bez hesla (anonymně, resp. s tím, co
+    /// má GVfs uložené); když to nevyjde, otevře se dialog předvyplněný
+    /// serverem/sdílením/uživatelem, stejně jako u dvojkliku v "Síti".
+    /// Běží-li zrovna jiné připojení, zařadí se do fronty.
+    fn start_target_mount(&mut self, target: ActivePanel, t: NetTarget, focus: bool) {
+        if self.net_mount_busy || self.show_net_mount {
+            self.net_mount_queue.push_back((target, t, focus));
+            return;
+        }
+        self.net_protocol = t.protocol;
+        self.net_server = t.server;
+        self.net_share = t.share;
+        self.net_domain = "WORKGROUP".to_string();
+        self.net_user = t.user;
+        self.net_password.clear();
+        self.net_anonymous = false;
+        self.net_mount_target = target;
+        self.net_mount_from_browse = true;
+        self.net_mount_subpath = t.subpath;
+        self.net_mount_focus = focus;
+        self.net_mount_error = None;
+        self.op_status = Some(StatusMsg::Info(format!(
+            "Připojuji {}://{}/{} …", self.net_protocol.scheme(), self.net_server, self.net_share
+        )));
+        self.start_net_mount();
+    }
+
+    /// Spustí další připojení z fronty (pokud nějaké čeká).
+    fn start_next_queued_mount(&mut self) {
+        if let Some((target, t, focus)) = self.net_mount_queue.pop_front() {
+            self.start_target_mount(target, t, focus);
+        }
     }
 
     /// Odstartuje "vstup" do uzlu síťového výpisu, který sám nejde
     /// prohlížet bez připojení (server, workgroup...) - viz
     /// `NetActivation::Drill` a `gio_browse_worker`.
     fn start_network_drill(&mut self, uri: String, name: String) {
-        if self.net_browse_busy { return; }
+        if self.net_browse_busy {
+            self.op_status = Some(StatusMsg::Warn(format!(
+                "Ještě se načítá {} - chvíli strpení (max. 25 s).", self.net_browse_name
+            )));
+            return;
+        }
+        let uri = if uri.to_ascii_lowercase().starts_with("smb://") { uri.replacen(":445/", "/", 1) } else { uri };
         self.net_browse_busy = true;
         self.net_browse_target = self.active;
         self.net_browse_uri = uri.clone();
-        self.net_browse_name = name;
+        self.net_browse_name = name.clone();
+        self.active_panel_mut().error = None;
+        self.op_status = Some(StatusMsg::Info(format!("Otevírám {} …", name)));
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.net_browse_rx = Some(rx);
@@ -5194,15 +5837,24 @@ impl FileManagerApp {
                     ActivePanel::Left  => &mut self.left,
                     ActivePanel::Right => &mut self.right,
                 };
-                if panel.net_location.is_some() {
-                    if let Some(loc) = &mut panel.net_location {
-                        loc.stack.push((uri, name));
-                    }
-                    panel.error = None;
-                    panel.apply_network_children(children);
+                // Drill odstartovaný z adresního řádku (`smb://server/`) -
+                // panel ještě není ve virtuálním síťovém výpisu, založíme ho
+                // (s kořenem "Síť" pod sebou, ať ".." vede tam, kam čekáš).
+                if panel.net_location.is_none() {
+                    panel.archive_location = None;
+                    panel.net_location = Some(NetLocation {
+                        stack: vec![("network:///".to_string(), "🌐 Síť".to_string())],
+                        children: Vec::new(),
+                    });
                 }
-                // Jinak (net_location mezitím zmizel - uživatel odešel
-                // jinam dřív, než vlákno doběhlo) výsledek jen zahodíme.
+                if let Some(loc) = &mut panel.net_location {
+                    loc.stack.push((uri, name));
+                }
+                panel.error = None;
+                panel.cursor = 0;
+                panel.cursor_moved = true;
+                panel.apply_network_children(children);
+                self.op_status = None;
             }
             Ok(Err(e)) => {
                 self.net_browse_busy = false;
@@ -5211,7 +5863,8 @@ impl FileManagerApp {
                     ActivePanel::Left  => &mut self.left,
                     ActivePanel::Right => &mut self.right,
                 };
-                panel.error = Some(e);
+                panel.error = Some(e.clone());
+                self.op_status = Some(StatusMsg::Error(format!("{}: {}", self.net_browse_name, e)));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.net_browse_rx = Some(rx);
@@ -5234,12 +5887,13 @@ impl FileManagerApp {
         let user      = self.net_user.clone();
         let password  = self.net_password.clone();
         let anonymous = self.net_anonymous;
+        let remember  = self.net_remember;
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.net_mount_rx = Some(rx);
 
         thread::spawn(move || {
-            let result = gio_mount_worker(protocol, server, share, domain, user, password, anonymous);
+            let result = net_mount_job(protocol, server, share, domain, user, password, anonymous, remember);
             let _ = tx.send(result);
         });
     }
@@ -5247,7 +5901,7 @@ impl FileManagerApp {
     fn poll_net_mount(&mut self) {
         let Some(rx) = self.net_mount_rx.take() else { return };
         match rx.try_recv() {
-            Ok(Ok(path)) => {
+            Ok(Ok((path, secret_warning))) => {
                 self.net_mount_busy = false;
                 self.net_mount_from_browse = false;
                 self.net_password.clear();
@@ -5256,13 +5910,30 @@ impl FileManagerApp {
                     ActivePanel::Left  => &mut self.left,
                     ActivePanel::Right => &mut self.right,
                 };
+                let subpath = std::mem::take(&mut self.net_mount_subpath);
+                let mut dest = path;
+                let mut sub_missing = false;
+                if !subpath.is_empty() {
+                    let sub = dest.join(&subpath);
+                    if sub.is_dir() { dest = sub; } else { sub_missing = true; }
+                }
                 panel.archive_location = None;
                 panel.net_location = None;
-                panel.current_path = path;
+                panel.current_path = dest;
                 panel.refresh();
-                self.active = target;
+                panel.cursor = 0;
+                panel.cursor_moved = true;
+                if self.net_mount_focus { self.active = target; }
+                self.net_mount_focus = true;
                 self.show_net_mount = false;
-                self.op_status = Some(StatusMsg::Info("Síťová složka připojena.".to_string()));
+                self.op_status = Some(if let Some(w) = secret_warning {
+                    StatusMsg::Warn(format!("Síťová složka připojena. {}", w))
+                } else if sub_missing {
+                    StatusMsg::Warn(format!("Síťová složka připojena, ale podsložka '{}' neexistuje.", subpath))
+                } else {
+                    StatusMsg::Info("Síťová složka připojena.".to_string())
+                });
+                self.start_next_queued_mount();
             }
             Ok(Err(e)) => {
                 self.net_mount_busy = false;
@@ -5271,6 +5942,7 @@ impl FileManagerApp {
                     // Automatický pokus (z dvojkliku v Síti) selhal - otevřeme
                     // dialog předvyplněný, ať uživatel doplní přihlašovací údaje.
                     self.show_net_mount = true;
+                    self.net_focus_field = Some(if self.net_user.is_empty() { 3 } else { 4 });
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -5282,32 +5954,104 @@ impl FileManagerApp {
         }
     }
 
-    /// Odpojí síťovou (gvfs) složku, ve které se momentálně nachází
-    /// aktivní panel - hledá se podle "/gvfs/" v aktuální cestě, takže
-    /// funguje z libovolné podsložky mountu, ne jen z jeho kořene.
-    fn unmount_active_net_share(&mut self) {
-        let path_str = self.active_panel().current_path.to_string_lossy().to_string();
-        let Some(gvfs_idx) = path_str.find("/gvfs/") else {
-            self.op_status = Some(StatusMsg::Warn("Aktivní panel není v síťové (gvfs) složce.".to_string()));
+    /// Otevře dialog se seznamem aktuálně připojených síťových (GVfs)
+    /// složek. Předvybraná je ta, ve které stojí aktivní panel (pokud v
+    /// nějaké stojí) - odpojit jde ale kterákoliv, ne jen "ta aktuální".
+    fn open_unmount_dialog(&mut self) {
+        let mut list: Vec<(String, PathBuf)> = Vec::new();
+        if let Some(dir) = gvfs_runtime_dir() {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let path = e.path();
+                    let raw = e.file_name().to_string_lossy().to_string();
+                    let label = match parse_net_target(&path.to_string_lossy()) {
+                        Some(t) => {
+                            let user = if t.user.is_empty() { String::new() } else { format!("{}@", t.user) };
+                            format!("{}://{}{}/{}", t.protocol.scheme(), user, t.server, t.share)
+                        }
+                        None => raw,
+                    };
+                    list.push((label, path));
+                }
+            }
+        }
+        list.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        if list.is_empty() {
+            self.op_status = Some(StatusMsg::Warn("Není připojená žádná síťová složka.".to_string()));
             return;
-        };
-        let after = &path_str[gvfs_idx + "/gvfs/".len()..];
-        let mount_name = after.split('/').next().unwrap_or("");
-        if mount_name.is_empty() { return; }
-        let mount_root = PathBuf::from(&path_str[..gvfs_idx + "/gvfs/".len()]).join(mount_name);
+        }
+        let active_path = self.active_panel().current_path.clone();
+        self.unmount_sel = list.iter().position(|(_, root)| active_path.starts_with(root)).unwrap_or(0);
+        self.unmount_list = list;
+        self.show_unmount_dialog = true;
+    }
 
-        match std::process::Command::new("gio").arg("mount").arg("-u").arg(&mount_root).output() {
+    fn render_unmount_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_unmount_dialog { return; }
+        let mut do_unmount = false;
+        let mut close = false;
+
+        let (up, down, enter, esc) = ctx.input(|i| (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Escape),
+        ));
+        let n = self.unmount_list.len();
+        if up && self.unmount_sel > 0 { self.unmount_sel -= 1; }
+        if down && self.unmount_sel + 1 < n { self.unmount_sel += 1; }
+        if enter { do_unmount = true; }
+        if esc { close = true; }
+
+        egui::Window::new("Odpojit síťovou složku")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Vyber složku k odpojení:");
+                ui.add_space(4.0);
+                for (i, (label, _)) in self.unmount_list.iter().enumerate() {
+                    let resp = ui.selectable_label(i == self.unmount_sel, format!("🖧  {}", label));
+                    if resp.clicked() { self.unmount_sel = i; }
+                    if resp.double_clicked() { self.unmount_sel = i; do_unmount = true; }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Odpojit").clicked() { do_unmount = true; }
+                    if ui.button("Zavřít").clicked() { close = true; }
+                });
+            });
+
+        if do_unmount {
+            if let Some((label, root)) = self.unmount_list.get(self.unmount_sel).cloned() {
+                self.unmount_net_root(&label, &root);
+            }
+            close = true;
+        }
+        if close {
+            self.show_unmount_dialog = false;
+            self.unmount_list.clear();
+        }
+    }
+
+    /// Odpojí jeden GVfs mount bod; panely, které v něm stály, přesune do
+    /// domovské složky (jinak by zůstaly na neexistující cestě).
+    fn unmount_net_root(&mut self, label: &str, root: &PathBuf) {
+        match std::process::Command::new("gio").arg("mount").arg("-u").arg(root).output() {
             Ok(o) if o.status.success() => {
                 let home = dirs_home();
-                let panel = self.active_panel_mut();
-                panel.archive_location = None;
-                panel.current_path = home;
-                panel.refresh();
-                self.op_status = Some(StatusMsg::Info("Síťová složka odpojena.".to_string()));
+                for panel in [&mut self.left, &mut self.right] {
+                    if panel.current_path.starts_with(root) {
+                        panel.archive_location = None;
+                        panel.current_path = home.clone();
+                        panel.refresh();
+                    }
+                }
+                self.op_status = Some(StatusMsg::Info(format!("Odpojeno: {}", label)));
             }
             Ok(o) => {
                 let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                self.op_status = Some(StatusMsg::Error(format!("Odpojení selhalo: {}", msg)));
+                self.op_status = Some(StatusMsg::Error(format!("Odpojení {} selhalo: {}", label, msg)));
             }
             Err(e) => {
                 self.op_status = Some(StatusMsg::Error(format!("Odpojení selhalo: {}", e)));
@@ -5320,6 +6064,18 @@ impl FileManagerApp {
         let mut connect = false;
         let mut close = false;
 
+        // ── Klávesnice v dialogu: Tab/Shift+Tab jen mezi poli dialogu (s
+        // označením celého obsahu pro rychlé přepsání), Enter = Připojit,
+        // Esc = Zavřít.
+        let field_count = if self.net_protocol == NetShareProtocol::Smb && !self.net_anonymous { 5 } else { 2 };
+        let (enter, esc) = ctx.input(|i| (
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Escape),
+        ));
+        let focused = ctx.memory(|m| m.focused());
+        let focused_idx = NET_FIELD_IDS[..field_count].iter()
+            .position(|name| Some(egui::Id::new(*name)) == focused);
+
         egui::Window::new("Připojit síťovou složku (SMB/NFS)")
             .collapsible(false)
             .resizable(false)
@@ -5331,15 +6087,21 @@ impl FileManagerApp {
                 });
                 ui.add_space(4.0);
 
+                // `lock_focus(true)` = Tab neodvede fokus mimo dialog (do panelů
+                // za ním); přechod mezi poli řešíme níže sami, jen v rámci dialogu.
                 egui::Grid::new("net_mount_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("Server:");
                     ui.add(egui::TextEdit::singleline(&mut self.net_server)
+                        .id(egui::Id::new(NET_FIELD_IDS[0]))
+                        .lock_focus(true)
                         .hint_text("např. truenas.local")
                         .desired_width(240.0));
                     ui.end_row();
 
                     ui.label("Sdílená složka:");
                     ui.add(egui::TextEdit::singleline(&mut self.net_share)
+                        .id(egui::Id::new(NET_FIELD_IDS[1]))
+                        .lock_focus(true)
                         .hint_text("např. download")
                         .desired_width(240.0));
                     ui.end_row();
@@ -5347,21 +6109,36 @@ impl FileManagerApp {
                     if self.net_protocol == NetShareProtocol::Smb {
                         ui.label("Doména:");
                         ui.add_enabled(!self.net_anonymous,
-                            egui::TextEdit::singleline(&mut self.net_domain).desired_width(240.0));
+                            egui::TextEdit::singleline(&mut self.net_domain)
+                                .id(egui::Id::new(NET_FIELD_IDS[2]))
+                                .lock_focus(true)
+                                .desired_width(240.0));
                         ui.end_row();
 
                         ui.label("Uživatel:");
                         ui.add_enabled(!self.net_anonymous,
-                            egui::TextEdit::singleline(&mut self.net_user).desired_width(240.0));
+                            egui::TextEdit::singleline(&mut self.net_user)
+                                .id(egui::Id::new(NET_FIELD_IDS[3]))
+                                .lock_focus(true)
+                                .desired_width(240.0));
                         ui.end_row();
 
                         ui.label("Heslo:");
                         ui.add_enabled(!self.net_anonymous,
-                            egui::TextEdit::singleline(&mut self.net_password).password(true).desired_width(240.0));
+                            egui::TextEdit::singleline(&mut self.net_password)
+                                .id(egui::Id::new(NET_FIELD_IDS[4]))
+                                .lock_focus(true)
+                                .password(true)
+                                .desired_width(240.0));
                         ui.end_row();
 
                         ui.label("");
                         ui.checkbox(&mut self.net_anonymous, "Anonymní přístup (bez přihlašovacích údajů)");
+                        ui.end_row();
+
+                        ui.label("");
+                        ui.add_enabled(!self.net_anonymous,
+                            egui::Checkbox::new(&mut self.net_remember, "Zapamatovat heslo (uloží se do klíčenky KWallet / GNOME)"));
                         ui.end_row();
                     }
                 });
@@ -5387,6 +6164,23 @@ impl FileManagerApp {
                 });
             });
 
+        let field_len = |i: usize| match i {
+            0 => self.net_server.chars().count(),
+            1 => self.net_share.chars().count(),
+            2 => self.net_domain.chars().count(),
+            3 => self.net_user.chars().count(),
+            _ => self.net_password.chars().count(),
+        };
+        if let Some(i) = self.net_focus_field.take().map(|i| i.min(field_count - 1)) {
+            focus_select_all(ctx, egui::Id::new(NET_FIELD_IDS[i]), field_len(i));
+        }
+        let fields: Vec<(egui::Id, usize)> = (0..field_count)
+            .map(|i| (egui::Id::new(NET_FIELD_IDS[i]), field_len(i)))
+            .collect();
+        dialog_tab_nav(ctx, self.dlg_tab, &fields, false);
+        if enter && focused_idx.is_some() && !self.net_mount_busy { connect = true; }
+        if esc { close = true; }
+
         if connect {
             self.net_mount_from_browse = false;
             self.start_net_mount();
@@ -5397,7 +6191,12 @@ impl FileManagerApp {
             self.net_mount_busy  = false;
             self.net_mount_rx    = None;
             self.net_mount_from_browse = false;
+            self.net_mount_subpath.clear();
+            self.net_mount_focus = true;
             self.net_password.clear();
+            // Zavřením dialogu uživatel ruší i čekající připojení ve frontě
+            // (např. druhý panel dvojité záložky).
+            self.net_mount_queue.clear();
         }
     }
 
@@ -6088,7 +6887,11 @@ fn render_panel(
             });
             if do_navigate {
                 *active = which;
-                if let Err(e) = panel.navigate_to_input() { err = Some(e); }
+                match panel.navigate_to_input() {
+                    Ok(Some(action)) => panel_action = Some(action),
+                    Ok(None) => {}
+                    Err(e) => err = Some(e),
+                }
             }
             if let Some(path) = breadcrumb_nav {
                 *active = which;
@@ -6760,4 +7563,42 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod net_target_tests {
+    use super::*;
+
+    fn t(proto: NetShareProtocol, server: &str, share: &str, user: &str, sub: &str) -> NetTarget {
+        NetTarget { protocol: proto, server: server.into(), share: share.into(), user: user.into(), subpath: sub.into() }
+    }
+
+    #[test]
+    fn smb_uri_variants() {
+        use NetShareProtocol::*;
+        assert_eq!(parse_net_target("smb://192.168.1.2/VIDEO/"), Some(t(Smb, "192.168.1.2", "VIDEO", "", "")));
+        assert_eq!(parse_net_target("SMB://nas/Video/Filmy/2024"), Some(t(Smb, "nas", "Video", "", "Filmy/2024")));
+        assert_eq!(parse_net_target("smb://david@nas:445/data"), Some(t(Smb, "nas", "data", "david", "")));
+        assert_eq!(parse_net_target("smb://nas/My%20Share/a%20b"), Some(t(Smb, "nas", "My Share", "", "a b")));
+        assert_eq!(parse_net_target("smb://nas/"), None);
+        assert_eq!(parse_net_target("nfs://nas/mnt/pool/video"), Some(t(Nfs, "nas", "mnt/pool/video", "", "")));
+    }
+
+    #[test]
+    fn gvfs_paths() {
+        use NetShareProtocol::*;
+        assert_eq!(
+            parse_net_target("/run/user/1000/gvfs/smb-share:server=192.168.1.2,share=video/Filmy/X"),
+            Some(t(Smb, "192.168.1.2", "video", "", "Filmy/X"))
+        );
+        assert_eq!(
+            parse_net_target("/run/user/1000/gvfs/smb-share:domain=WG,server=nas,share=data,user=david"),
+            Some(t(Smb, "nas", "data", "david", ""))
+        );
+        assert_eq!(
+            parse_net_target("/run/user/1000/gvfs/nfs:host=nas,prefix=%2Fmnt%2Fpool/sub"),
+            Some(t(Nfs, "nas", "mnt/pool", "", "sub"))
+        );
+        assert_eq!(parse_net_target("/home/trubka/Dokumenty"), None);
+    }
 }
