@@ -3284,7 +3284,7 @@ impl FileManagerApp {
 
     /// Nastaví file system watcher na aktuální složky obou panelů.
     /// Volá se kdykoli se změní sledovaná cesta.
-    fn update_watcher(&mut self) {
+    fn update_watcher(&mut self, ctx: &egui::Context) {
         let left  = self.left.current_path.clone();
         let right = self.right.current_path.clone();
 
@@ -3293,9 +3293,19 @@ impl FileManagerApp {
             return;
         }
 
-        // Vytvoříme nový watcher s channel pro události
+        // Vytvoříme nový watcher s channel pro události. Kromě poslání do
+        // kanálu musí watcher appku i "probudit" - egui jinak překresluje
+        // (a tedy i čte kanál) jen při pohybu myši / stisku klávesy, takže
+        // by se např. rostoucí velikost stahovaného souboru neukázala,
+        // dokud na okno nesáhneš. Překreslení je sdružené po 250 ms, ať
+        // soubor, do kterého se zapisuje nepřetržitě, nevytíží CPU.
         let (tx, rx) = std::sync::mpsc::channel();
-        match notify::recommended_watcher(tx) {
+        let wake_ctx = ctx.clone();
+        let handler = move |res: Result<FsEvent, notify::Error>| {
+            let _ = tx.send(res);
+            wake_ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        };
+        match notify::recommended_watcher(handler) {
             Ok(mut watcher) => {
                 // Sledujeme obě složky (non-recursive - jen přímý obsah)
                 let _ = watcher.watch(&left,  RecursiveMode::NonRecursive);
@@ -3321,6 +3331,10 @@ impl FileManagerApp {
         let Some(rx) = &self.fs_rx else { return };
         let mut refresh_left  = false;
         let mut refresh_right = false;
+        // Soubory, kterým se změnil obsah/metadata (zápis) - u nich jen
+        // aktualizujeme velikost a čas na místě, bez celého refreshe
+        // (ten by zrušil výběr a při nepřetržitém zápisu blikal).
+        let mut touched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         while let Ok(Ok(event)) = rx.try_recv() {
             // Zajímají nás jen události které mění obsah adresáře
@@ -3338,12 +3352,37 @@ impl FileManagerApp {
                         }
                     }
                 }
+                // Zápis do souboru (Linux/inotify: Modify(Data), Modify(Metadata),
+                // zavření po zápisu; Windows: Modify(Any)).
+                Modify(_) | Access(notify::event::AccessKind::Close(notify::event::AccessMode::Write)) => {
+                    for path in event.paths {
+                        touched.insert(path);
+                    }
+                }
                 _ => {}
             }
         }
 
         if refresh_left  { self.left.refresh(); }
         if refresh_right { self.right.refresh(); }
+
+        for path in touched {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { continue };
+            let name = name.to_string_lossy();
+            for panel in [&mut self.left, &mut self.right] {
+                if panel.archive_location.is_some() || panel.net_location.is_some()
+                    || panel.current_path != parent
+                {
+                    continue;
+                }
+                if let Some(entry) = panel.entries.iter_mut().find(|e| e.name == name) {
+                    if let Ok(meta) = fs::metadata(&path) {
+                        entry.size = meta.len();
+                        entry.modified = meta.modified().ok();
+                    }
+                }
+            }
+        }
     }
 
     /// Uloží aktuální stav (naposledy otevřené složky + záložky) na disk,
@@ -4106,7 +4145,7 @@ impl eframe::App for FileManagerApp {
         self.poll_hash();
         self.poll_fs_events();
         self.poll_dir_sizes();
-        self.update_watcher();
+        self.update_watcher(ctx);
 
         // Spustit výpočet velikosti složek pokud bylo požádáno z render_panel
         if self.left.dir_size_needed || self.right.dir_size_needed {
