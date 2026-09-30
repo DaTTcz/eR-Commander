@@ -1087,9 +1087,14 @@ fn spawn_file_op(
 
         pool.install(|| {
             files.par_iter().enumerate().for_each(|(par_idx, src)| {
-                // Každý rayon worker dostane pevné thread_id (0..num_threads)
-                // Trik: par_idx mod num_threads dává konzistentní slot ID
-                let thread_id = par_idx % num_threads;
+                // Slot v progress dialogu = index rayon workeru, který soubor
+                // právě zpracovává (0..num_threads). Každý worker kopíruje
+                // v jednu chvíli jen jeden soubor, takže se sloty nikdy
+                // nepřekrývají. (Dřív tu bylo `par_idx % num_threads`, jenže
+                // rayon nerozděluje soubory po řadě - dva současně kopírované
+                // soubory pak sdílely jeden slot: jejich bajty se sčítaly
+                // (např. "694 MB / 579 MB") a jeden progress bar chyběl.)
+                let thread_id = rayon::current_thread_index().unwrap_or(par_idx) % num_threads;
 
                 if flag_thread.load(Ordering::Relaxed) == OP_STOP { return; }
                 while flag_thread.load(Ordering::Relaxed) == OP_PAUSE {
@@ -2768,6 +2773,15 @@ struct FileManagerApp {
     dlg_tab: i8,
     /// Po kliknutí na ✏ u záložky: dát fokus poli s názvem, jakmile se vykreslí.
     bm_focus_pending: bool,
+    /// Dialog hledání: dát fokus poli "Název" při dalším vykreslení.
+    search_focus_pending: bool,
+    /// Dialog hledání: vybraný řádek výsledků (šipky ↑/↓, Enter = skok).
+    search_sel: Option<usize>,
+    /// Hromadné přejmenování: fokus do pole Maska při dalším vykreslení.
+    rename_focus_pending: bool,
+    /// Vybraná záložka v dialogu záložek (šipky ↑↓, Enter = přejít).
+    bm_sel: usize,
+    bm_scroll: bool,
 
     // Dialog "Odpojit síťovou složku" - výběr z aktuálně připojených GVfs
     // sdílení (zobrazený název, kořen mount bodu), `unmount_sel` = vybraný řádek.
@@ -2990,6 +3004,11 @@ impl Default for FileManagerApp {
             synth_release: false,
             dlg_tab: 0,
             bm_focus_pending: false,
+            search_focus_pending: false,
+            search_sel: None,
+            rename_focus_pending: false,
+            bm_sel: 0,
+            bm_scroll: false,
             show_unmount_dialog: false,
             unmount_list: Vec::new(),
             unmount_sel: 0,
@@ -3169,6 +3188,10 @@ impl FileManagerApp {
         self.search_content.clear();
         self.search_results.clear();
         self.search_running = false;
+        self.search_sel = None;
+        // Kurzor rovnou do pole "Název souboru obsahuje" (adresář je
+        // předvyplněný aktuální složkou, takže se většinou jen píše název).
+        self.search_focus_pending = true;
         self.show_search = true;
     }
 
@@ -3535,6 +3558,7 @@ impl FileManagerApp {
     /// vybraná záložka skočit (ten, ze kterého se dialog otevřel hvězdičkou).
     fn open_bookmarks(&mut self, target: ActivePanel) {
         self.bookmarks_target = target;
+        self.bm_sel = 0;
         self.show_bookmarks = true;
     }
 
@@ -4183,6 +4207,7 @@ impl eframe::App for FileManagerApp {
                 if tbtn!("Ctrl+M Vše").clicked() {
                     self.rename_error = None;
                     self.show_rename_dialog = true;
+                    self.rename_focus_pending = true;
                 }
                 if tbtn!("Ctrl+N Novy soubor").clicked() {
                     self.new_file_name = "novy_soubor.txt".to_string();
@@ -4504,7 +4529,9 @@ impl FileManagerApp {
             if esc { self.cancel_pending(); }
         } else if self.show_rename_dialog {
             let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
             if esc { self.show_rename_dialog = false; self.rename_error = None; }
+            else if enter { self.confirm_bulk_rename(); }
         } else if self.show_search {
             let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             if esc { self.show_search = false; }
@@ -4527,10 +4554,38 @@ impl FileManagerApp {
             }
         } else if self.show_hash_dialog {
             let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            // Enter zavře hotový výsledek (během výpočtu nic nedělá - na
+            // zrušení je Esc, ať se výpočet nezastaví omylem).
+            let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            if enter && !self.hash_running {
+                self.show_hash_dialog = false;
+                self.hash_flag = None;
+            }
             if esc {
                 if let Some(f) = &self.hash_flag { f.store(OP_STOP, Ordering::Relaxed); }
                 self.show_hash_dialog = false;
                 self.hash_flag = None;
+            }
+        } else if self.show_about {
+            let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let esc   = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if enter || esc { self.show_about = false; }
+        } else if self.show_settings {
+            // Jen Esc - Enter patří textovému poli s cestou k editoru.
+            let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if esc { self.show_settings = false; }
+        } else if self.show_update_dialog {
+            let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let esc   = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            match self.update_state.clone() {
+                // Enter = "Stáhnout a nainstalovat" (resp. otevřít stránku s balíčky)
+                UpdateState::UpdateAvailable { .. } => {
+                    if enter { self.download_and_replace(); }
+                    else if esc { self.show_update_dialog = false; }
+                }
+                // Během stahování nic - aplikace se po dokončení sama restartuje.
+                UpdateState::Downloading => {}
+                _ => { if enter || esc { self.show_update_dialog = false; } }
             }
         }
 
@@ -4564,19 +4619,35 @@ impl FileManagerApp {
 
         // F klávesy čteme PŘED navigačním consume blokem přes key_pressed
         // (consume_key s Modifiers::NONE může selhat na NB s Fn vrstvou)
-        let (f5, f6, f7, f8, ctrl_m, alt_f7, f2_key, ctrl_n, ctrl_e) = ctx.input(|i| {
+        let (f5, f6, f8, ctrl_m, f2_key, ctrl_n, ctrl_e) = ctx.input(|i| {
             (
                 !i.modifiers.alt && i.key_pressed(egui::Key::F5), // F5 bez Alt
                 i.key_pressed(egui::Key::F6),
-                !i.modifiers.alt && i.key_pressed(egui::Key::F7), // F7 bez Alt
                 i.key_pressed(egui::Key::F8),
                 i.modifiers.ctrl  && i.key_pressed(egui::Key::M),
-                i.modifiers.alt   && i.key_pressed(egui::Key::F7), // Alt+F7
                 i.key_pressed(egui::Key::F2),
                 i.modifiers.ctrl  && i.key_pressed(egui::Key::N),
                 i.modifiers.ctrl  && i.key_pressed(egui::Key::E)
                     || i.key_pressed(egui::Key::F3),
             )
+        });
+        // F7 vs. Alt+F7 (+ Ctrl+F jako náhradní zkratka pro hledání):
+        // modifikátory bereme přímo z události stisku klávesy, ne z
+        // "aktuálního" stavu - na Waylandu (KDE) se stav Alt může do appky
+        // dostat až po samotném F7 a Alt+F7 se pak tvářilo jako holé F7
+        // (= Nová složka místo Hledat).
+        let (f7, alt_f7) = ctx.input(|i| {
+            let mut plain = false;
+            let mut with_alt = false;
+            for ev in &i.events {
+                if let egui::Event::Key { key: egui::Key::F7, pressed: true, modifiers, .. } = ev {
+                    if modifiers.alt || i.modifiers.alt { with_alt = true; } else { plain = true; }
+                }
+                if let egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. } = ev {
+                    if modifiers.command && !modifiers.alt && !modifiers.shift { with_alt = true; }
+                }
+            }
+            (plain && !with_alt, with_alt)
         });
         let f4     = ctx.input(|i| i.key_pressed(egui::Key::F4));
         let alt_f5 = ctx.input(|i| i.modifiers.alt && !i.modifiers.ctrl && i.key_pressed(egui::Key::F5));
@@ -4644,7 +4715,7 @@ impl FileManagerApp {
             if alt_f7 { self.open_search_dialog(); }
             if f8 { self.request_delete(); }
             if f2 { self.open_rename_single(); }
-            if ctrl_m { self.rename_error = None; self.show_rename_dialog = true; }
+            if ctrl_m { self.rename_error = None; self.show_rename_dialog = true; self.rename_focus_pending = true; }
             if ctrl_n {
                 self.new_file_name = "novy_soubor.txt".to_string();
                 self.new_file_error = None;
@@ -4867,17 +4938,22 @@ impl FileManagerApp {
             (egui::Id::new("ren_find"), self.rename_pattern.chars().count()),
             (egui::Id::new("ren_repl"), self.rename_replacement.chars().count()),
         ], false);
+        let mut do_confirm = false;
         egui::Window::new("Hromadné přejmenování")
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label("Maska nového názvu (nepovinné):");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.rename_mask)
+                    let mask_resp = ui.add(egui::TextEdit::singleline(&mut self.rename_mask)
                         .id(egui::Id::new("ren_mask"))
                         .lock_focus(true)
                         .hint_text("např. [N]_[C].[E]")
                         .desired_width(220.0));
+                    if self.rename_focus_pending {
+                        self.rename_focus_pending = false;
+                        focus_select_all(ui.ctx(), mask_resp.id, self.rename_mask.chars().count());
+                    }
                     if ui.button("[N]").on_hover_text("Vložit token: název bez přípony").clicked() {
                         self.rename_mask.push_str("[N]");
                     }
@@ -4945,14 +5021,8 @@ impl FileManagerApp {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Provést").clicked() {
-                        self.apply_bulk_rename();
-                        if self.rename_error.is_none() {
-                            self.show_rename_dialog = false;
-                            self.rename_pattern.clear();
-                            self.rename_replacement.clear();
-                            self.rename_mask.clear();
-                        }
+                    if ui.button("Provést (Enter)").clicked() {
+                        do_confirm = true;
                     }
                     if ui.button("Zrušit").clicked() {
                         self.show_rename_dialog = false;
@@ -4960,6 +5030,18 @@ impl FileManagerApp {
                     }
                 });
             });
+        if do_confirm { self.confirm_bulk_rename(); }
+    }
+
+    /// "Provést" v hromadném přejmenování (tlačítko i Enter).
+    fn confirm_bulk_rename(&mut self) {
+        self.apply_bulk_rename();
+        if self.rename_error.is_none() {
+            self.show_rename_dialog = false;
+            self.rename_pattern.clear();
+            self.rename_replacement.clear();
+            self.rename_mask.clear();
+        }
     }
 
     fn render_overwrite_dialog(&mut self, ctx: &egui::Context) {
@@ -5047,8 +5129,8 @@ impl FileManagerApp {
                         cmd!("Smazat",                "F8",      self.request_delete());
                         ui.separator(); ui.separator(); ui.end_row();
                         cmd!("Zabalit do ZIP",        "Alt+F5",  self.start_zip_pack());
-                        cmd!("Najít soubory/text",    "Alt+F7",  self.open_search_dialog());
-                        cmd!("Hromadné přejmenování", "Ctrl+M",  { self.rename_error = None; self.show_rename_dialog = true; });
+                        cmd!("Najít soubory/text",    "Alt+F7 / Ctrl+F",  self.open_search_dialog());
+                        cmd!("Hromadné přejmenování", "Ctrl+M",  { self.rename_error = None; self.show_rename_dialog = true; self.rename_focus_pending = true; });
                         cmd!("Kontrolní součet",      "Ctrl+H",  self.open_hash_dialog());
                         cmd!("Nový soubor",           "Ctrl+N",  { self.new_file_name = "novy_soubor.txt".to_string(); self.new_file_error = None; self.show_new_file = true; });
                         ui.separator(); ui.separator(); ui.end_row();
@@ -5157,13 +5239,44 @@ impl FileManagerApp {
         if !self.show_search {
             return;
         }
+        // Klávesnice: Tab/Shift+Tab = adresář → název → text → výsledky
+        // (v seznamu výsledků šipky ↑/↓ vybírají), Enter v poli = Hledat,
+        // Enter ve výsledcích = skok na soubor, Esc = zavřít (handle_shortcuts).
+        let has_results = !self.search_results.is_empty();
         dialog_tab_nav(ctx, self.dlg_tab, &[
             (egui::Id::new("search_root"), self.search_root.to_string_lossy().chars().count()),
             (egui::Id::new("search_name"), self.search_name.chars().count()),
             (egui::Id::new("search_content"), self.search_content.chars().count()),
-        ], false);
+        ], has_results);
         let mut open = true;
         let mut jump_to: Option<PathBuf> = None;
+
+        let field_ids = ["search_root", "search_name", "search_content"].map(|s| egui::Id::new(s));
+        let focused = ctx.memory(|m| m.focused());
+        let in_field = focused.map_or(false, |f| field_ids.contains(&f));
+        let (enter, up, down) = ctx.input(|i| (
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+        ));
+        if has_results && self.search_sel.is_none() {
+            self.search_sel = Some(0);
+        }
+        let mut scroll_to_sel = false;
+        if has_results && !in_field {
+            let last = self.search_results.len() - 1;
+            let cur = self.search_sel.unwrap_or(0).min(last);
+            if up   { self.search_sel = Some(cur.saturating_sub(1)); scroll_to_sel = true; }
+            if down { self.search_sel = Some((cur + 1).min(last));    scroll_to_sel = true; }
+        }
+        let mut do_search = false;
+        if enter {
+            if in_field {
+                do_search = true;
+            } else if let Some(i) = self.search_sel {
+                jump_to = self.search_results.get(i).cloned();
+            }
+        }
 
         egui::Window::new("Najít soubory")
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -5179,8 +5292,14 @@ impl FileManagerApp {
 
                 ui.add_space(4.0);
                 ui.label("Název souboru obsahuje:");
-                ui.add(egui::TextEdit::singleline(&mut self.search_name)
+                let name_resp = ui.add(egui::TextEdit::singleline(&mut self.search_name)
                     .id(egui::Id::new("search_name")).lock_focus(true));
+                if self.search_focus_pending {
+                    // Až tady - pole v tomhle framu opravdu existuje (fokus
+                    // na nevykreslený widget shodí accesskit).
+                    self.search_focus_pending = false;
+                    focus_select_all(ui.ctx(), name_resp.id, self.search_name.chars().count());
+                }
 
                 ui.label("Text uvnitř souboru (volitelné, pomalejší):");
                 ui.add(egui::TextEdit::singleline(&mut self.search_content)
@@ -5188,8 +5307,8 @@ impl FileManagerApp {
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Hledat").clicked() {
-                        self.start_search();
+                    if ui.button("Hledat (Enter)").clicked() {
+                        do_search = true;
                     }
                     if self.search_running {
                         ui.spinner();
@@ -5201,15 +5320,29 @@ impl FileManagerApp {
 
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for path in &self.search_results {
-                        if ui.selectable_label(false, path.display().to_string()).double_clicked() {
+                    for (i, path) in self.search_results.iter().enumerate() {
+                        let selected = self.search_sel == Some(i);
+                        let resp = ui.selectable_label(selected, path.display().to_string());
+                        if selected && scroll_to_sel {
+                            resp.scroll_to_me(None);
+                        }
+                        if resp.clicked() {
+                            self.search_sel = Some(i);
+                        }
+                        if resp.double_clicked() {
                             jump_to = Some(path.clone());
                         }
                     }
                 });
-                ui.label("(dvojklik na výsledek tě v panelu přenese přímo k souboru)");
+                ui.label(egui::RichText::new(
+                    "Tab = další pole / výsledky · ↑↓ výběr · Enter = hledat / skočit na soubor · Esc = zavřít")
+                    .small().weak());
             });
 
+        if do_search {
+            self.search_sel = None;
+            self.start_search();
+        }
         if !open {
             self.show_search = false;
         }
@@ -5541,7 +5674,7 @@ impl FileManagerApp {
                             });
                         } else {
                             // ── Normální zobrazení ──────────────────────────
-                            ui.horizontal(|ui| {
+                            let row = ui.horizontal(|ui| {
                                 // Přejít
                                 if ui.button("▶").on_hover_text("Přejít (Enter)").clicked() {
                                     jump_idx = Some(i);
@@ -5567,23 +5700,52 @@ impl FileManagerApp {
                                     if ui.button("🗑").on_hover_text("Smazat záložku").clicked() {
                                         remove_idx = Some(i);
                                     }
-                                    if ui.button("✏").on_hover_text("Upravit").clicked() {
+                                    if ui.button("✏").on_hover_text("Upravit (F2)").clicked() {
                                         edit_idx = Some(i);
                                     }
                                 });
                             });
+                            // Vybraná záložka (šipky ↑↓) - oranžový rámeček jako
+                            // výběr tlačítek v ostatních dialozích.
+                            if i == self.bm_sel.min(count.saturating_sub(1)) {
+                                ui.painter().rect_stroke(row.response.rect.expand(2.0), 3.0,
+                                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 190, 60)));
+                                if self.bm_scroll {
+                                    self.bm_scroll = false;
+                                    row.response.scroll_to_me(None);
+                                }
+                            }
                         }
                         ui.separator();
                     }
                 });
 
-                // Enter: při úpravě záložky = Uložit, jinak skok na první záložku
-                if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if self.bm_edit_idx.is_some() {
-                        save_edit = true;
-                    } else if !self.bookmarks.is_empty() {
-                        jump_idx = Some(0);
+                // Klávesnice: při úpravě Enter = Uložit (Esc = Zrušit úpravu,
+                // viz handle_shortcuts). Jinak ↑↓ výběr záložky, Enter = přejít,
+                // F2 = upravit, Ctrl+↑/↓ = posunout v pořadí.
+                if self.bm_edit_idx.is_some() {
+                    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) { save_edit = true; }
+                } else if count > 0 {
+                    let (enter, up, down, f2, ctrl) = ctx.input(|i| (
+                        i.key_pressed(egui::Key::Enter),
+                        i.key_pressed(egui::Key::ArrowUp),
+                        i.key_pressed(egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::F2),
+                        i.modifiers.command,
+                    ));
+                    let sel = self.bm_sel.min(count - 1);
+                    if up && sel > 0 {
+                        if ctrl { move_up = Some(sel); }
+                        self.bm_sel = sel - 1;
+                        self.bm_scroll = true;
                     }
+                    if down && sel + 1 < count {
+                        if ctrl { move_down = Some(sel); }
+                        self.bm_sel = sel + 1;
+                        self.bm_scroll = true;
+                    }
+                    if enter { jump_idx = Some(sel); }
+                    if f2 { edit_idx = Some(sel); }
                 }
             });
 
