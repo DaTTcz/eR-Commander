@@ -7,6 +7,14 @@ description = "Dvoupanelový správce souborů pro Windows a Linux postavený v 
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/DaTTcz/eR-Commander"
 
+# Workspace: eR Commander (kořen) + malý GTK4 pomocník er-drag pro
+# přetažení souborů do jiné aplikace (jen Linux). `cargo build` / `cargo run`
+# v kořeni staví jen eR Commander (default-members); pomocníka postaví
+# `cargo build -p er-drag` nebo `cargo build --workspace` (CI).
+[workspace]
+members = [".", "er-drag"]
+default-members = ["."]
+
 [[bin]]
 name = "eR_Commander"
 path = "src/main.rs"
@@ -35,3 +43,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # v okne), takze zde staci jen "rustls" - bez archive/compression features
 # potrebnych pro self_update::Update.
 self_update = { version = "0.41", default-features = false, features = ["rustls"] }
+
+# Nativní tažení souborů do jiných aplikací na Waylandu (viz modul
+# native_dnd v main.rs) - napojení na stejné Wayland spojení, jaké používá
+# winit; verze odpovídají těm, které už tahá eframe/winit (žádné nové knihovny).
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+raw-window-handle = "0.6"

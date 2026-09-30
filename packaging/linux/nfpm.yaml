@@ -21,6 +21,11 @@ contents:
     dst: /usr/bin/eR_Commander
     file_info:
       mode: 0755
+  # Pomocník pro přetažení souborů do jiné aplikace (GTK4, viz er-drag/)
+  - src: ./dist/er-drag
+    dst: /usr/lib/er-commander/er-drag
+    file_info:
+      mode: 0755
   - src: ./packaging/linux/eR_Commander.desktop
     dst: /usr/share/applications/eR_Commander.desktop
   - src: ./assets/app_icon.png
@@ -34,6 +39,8 @@ overrides:
     recommends:
       - libglib2.0-bin
       - gvfs-backends
+      - libgtk-4-1
   rpm:
     recommends:
       - gvfs
+      - gtk4

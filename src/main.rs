@@ -181,6 +181,9 @@ struct Panel {
     cursor_moved: bool,
     show_hidden: bool,
     inline_rename_idx: Option<usize>,
+    /// Tažení právě opustilo okno a předalo se pomocníkovi er-drag -
+    /// do puštění tlačítka myši už znovu nespouštět.
+    drag_out_done: bool,
     inline_rename_buf: String, // bylo kliknuto na složku? → spustit výpočet velikosti
     // Kolik znaků (od začátku) se má při otevření inline rename označit -
     // None = žádné čekající označení, Some(n) = jednorázově označit 0..n
@@ -208,6 +211,7 @@ impl Panel {
             cursor_moved: false,
             show_hidden: false,
             inline_rename_idx: None,
+            drag_out_done: false,
             inline_rename_buf: String::new(),
             inline_rename_select_end: None,
             sort_col: SortColumn::Name,
@@ -688,6 +692,12 @@ enum ContextAction {
     SelectAll,
     DeselectAll,
     Hash,
+    /// Tažení řádku opustilo okno - přetáhnout do jiné aplikace (na
+    /// Waylandu nativně, jinak přes okénko er-drag).
+    DragOut,
+    /// Totéž z kontextového menu - tlačítko myši už není stisknuté, takže
+    /// vždy přes okénko er-drag.
+    DragOutWindow,
 }
 
 fn sort_entries(items: &mut [FileEntry]) {
@@ -2486,6 +2496,22 @@ fn install_mode() -> InstallMode {
     InstallMode::Portable
 }
 
+/// Najde pomocníka `er-drag`: vedle vlastní binárky (vývoj `target/debug`,
+/// přenosná verze z tar.gz, AppImage `usr/bin`), v instalaci z balíčku
+/// (`/usr/lib/er-commander/`), nebo kdekoliv v PATH.
+fn find_drag_helper() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "er-drag.exe" } else { "er-drag" };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() { candidates.push(dir.join(name)); }
+    }
+    candidates.push(PathBuf::from("/usr/lib/er-commander").join(name));
+    if let Some(path_var) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path_var).map(|d| d.join(name)));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 fn fetch_latest_release() -> Result<UpdateCheckResult, String> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(GITHUB_OWNER)
@@ -2731,6 +2757,12 @@ struct FileManagerApp {
     /// Které pole dialogu připojení má dostat fokus při dalším vykreslení
     /// (index do NET_FIELD_IDS) - nastavuje se při otevření dialogu.
     net_focus_field: Option<usize>,
+    /// Nativní tažení do jiných aplikací (Wayland) - inicializuje se v
+    /// prvním framu, kdy je k dispozici handle okna.
+    native_dnd: Option<native_dnd::NativeDnd>,
+    native_dnd_init: bool,
+    /// Poslat egui syntetické puštění tlačítka (viz start_drag_out).
+    synth_release: bool,
     /// Tab (+1) / Shift+Tab (-1) stisknutý v tomto framu, když je otevřený
     /// dialog - viz `dialog_tab_nav`.
     dlg_tab: i8,
@@ -2953,6 +2985,9 @@ impl Default for FileManagerApp {
             net_mount_focus: true,
             net_mount_queue: std::collections::VecDeque::new(),
             net_focus_field: None,
+            native_dnd: None,
+            native_dnd_init: false,
+            synth_release: false,
             dlg_tab: 0,
             bm_focus_pending: false,
             show_unmount_dialog: false,
@@ -3930,7 +3965,35 @@ impl FileManagerApp {
 // =====================================================================
 
 impl eframe::App for FileManagerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.synth_release {
+            self.synth_release = false;
+            raw_input.events.push(egui::Event::PointerButton {
+                pos: egui::pos2(-10.0, -10.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: raw_input.modifiers,
+            });
+            raw_input.events.push(egui::Event::PointerGone);
+        }
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Nativní tažení ven (Wayland): připojit se na spojení winitu v
+        // prvním framu, pak každý frame zpracovat jeho události. Během
+        // tažení překreslujeme, jinak by se žádost cílové aplikace o data
+        // zpracovala až při dalším pohybu myši nad oknem.
+        if !self.native_dnd_init {
+            self.native_dnd_init = true;
+            self.native_dnd = native_dnd::NativeDnd::new(frame);
+        }
+        if let Some(dnd) = self.native_dnd.as_mut() {
+            dnd.dispatch();
+            if dnd.is_active() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            }
+        }
+
         // Tab spotřebujeme DŘÍVE než cokoliv jiného včetně egui focus navigation.
         // egui zpracovává Tab v InputState.prepare() což nastane při prvním
         // přístupu k input - proto ho musíme consume ještě před tím.
@@ -4221,6 +4284,8 @@ impl eframe::App for FileManagerApp {
                             panel.selected.clear();
                         }
                         ContextAction::Hash => self.open_hash_dialog(),
+                        ContextAction::DragOut => self.start_drag_out(true),
+                        ContextAction::DragOutWindow => self.start_drag_out(false),
                     }
                 }
             });
@@ -6003,6 +6068,69 @@ impl FileManagerApp {
         }
     }
 
+    /// Přetažení vybraných souborů (nebo souboru pod kurzorem) do jiné
+    /// aplikace. egui/winit tažení ven z okna neumí, proto se spustí malý
+    /// GTK4 pomocník `er-drag` (samostatný program z tohoto repa, viz
+    /// složka er-drag/), ze kterého se soubory přetáhnou do cíle.
+    fn start_drag_out(&mut self, from_drag: bool) {
+        let (virtual_view, paths) = {
+            let panel = self.active_panel();
+            (panel.archive_location.is_some() || panel.net_location.is_some(), panel.effective_paths())
+        };
+        if virtual_view {
+            self.op_status = Some(StatusMsg::Warn(
+                "Přetažení do jiné aplikace jde jen se skutečnými soubory (ne z archivu / Sítě).".to_string()));
+            return;
+        }
+        if paths.is_empty() {
+            self.op_status = Some(StatusMsg::Warn("Není vybraný žádný soubor.".to_string()));
+            return;
+        }
+        if !cfg!(target_os = "linux") {
+            self.op_status = Some(StatusMsg::Warn(
+                "Přetažení do jiné aplikace je zatím jen pro Linux.".to_string()));
+            return;
+        }
+        // Wayland: nativní tažení přímo z okna (tlačítko myši je pořád
+        // stisknuté - kompozitor převezme tažení a soubor "neseš" dál).
+        if from_drag {
+            if let Some(dnd) = self.native_dnd.as_mut() {
+                match dnd.start(&paths) {
+                    Ok(()) => {
+                        // egui se o puštění tlačítka nedozví (dostane ho
+                        // cílová aplikace) - pošleme mu ho sami, ať nezůstane
+                        // viset ve stavu "táhnu".
+                        self.synth_release = true;
+                        self.op_status = None;
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("eR Commander: nativní tažení selhalo ({}), použiji er-drag", e);
+                    }
+                }
+            }
+        }
+        let Some(helper) = find_drag_helper() else {
+            self.op_status = Some(StatusMsg::Error(
+                "Chybí pomocník er-drag (při vývoji: cargo build -p er-drag).".to_string()));
+            return;
+        };
+        match std::process::Command::new(&helper).args(&paths).spawn() {
+            Ok(_) => {
+                let n = paths.len();
+                self.op_status = Some(StatusMsg::Info(if n == 1 {
+                    "Přetáhni soubor z okénka do cílové aplikace.".to_string()
+                } else {
+                    format!("Přetáhni {} položek z okénka do cílové aplikace.", n)
+                }));
+            }
+            Err(e) => {
+                self.op_status = Some(StatusMsg::Error(format!(
+                    "Nepodařilo se spustit {}: {}", helper.display(), e)));
+            }
+        }
+    }
+
     /// Otevře dialog se seznamem aktuálně připojených síťových (GVfs)
     /// složek. Předvybraná je ta, ve které stojí aktivní panel (pokud v
     /// nějaké stojí) - odpojit jde ale kterákoliv, ne jen "ta aktuální".
@@ -6657,6 +6785,20 @@ impl FileManagerApp {
                     fs::rename(&new_bin, &current_exe)
                         .map_err(|e| format!("Nahrazení binárky: {}", e))?;
 
+                    // Pomocník er-drag (od 0.8.12 v tar.gz vedle hlavní
+                    // binárky) - aktualizujeme ho taky, best-effort.
+                    let new_helper = tmp_dir.join("er-drag");
+                    if new_helper.is_file() {
+                        if let Some(dir) = current_exe.parent() {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = fs::set_permissions(&new_helper, fs::Permissions::from_mode(0o755));
+                            }
+                            let _ = fs::rename(&new_helper, dir.join("er-drag"));
+                        }
+                    }
+
                     let _ = fs::remove_dir_all(&tmp_dir);
 
                     std::process::Command::new(&current_exe)
@@ -7310,7 +7452,21 @@ fn render_panel(
                     }
 
                     // Drag start - při tažení nastavíme zdroj a označíme soubor
-                    if is_dragging {
+                    // Tažení ven z okna -> pomocník er-drag (egui/winit tažení
+                    // do jiné aplikace samo neumí). Jednou za tažení.
+                    if is_dragging && drag_src == &Some(which) && !panel.drag_out_done
+                        && panel.archive_location.is_none() && panel.net_location.is_none()
+                    {
+                        let screen = ui.ctx().screen_rect();
+                        let outside = ui.input(|inp| inp.pointer.latest_pos())
+                            .map_or(true, |p| !screen.shrink(2.0).contains(p));
+                        if outside {
+                            panel.drag_out_done = true;
+                            *drag_src = None;
+                            ctx_action = Some(ContextAction::DragOut);
+                        }
+                    }
+                    if is_dragging && !panel.drag_out_done {
                         *active = which;
                         *drag_src = Some(which);
                         if !panel.selected.contains(&i) {
@@ -7394,6 +7550,12 @@ fn render_panel(
                                 ui.close_menu();
                             }
                         }
+                        if !in_archive && panel.net_location.is_none() {
+                            if ui.button("↗ Přetáhnout do jiné aplikace").clicked() {
+                                ctx_action = Some(ContextAction::DragOutWindow);
+                                ui.close_menu();
+                            }
+                        }
                         if ui.button("📄 Nový soubor   Ctrl+N").clicked() { ctx_action = Some(ContextAction::NewFile); ui.close_menu(); }
                         ui.separator();
                         if ui.button("☑ Označit vše").clicked()  { ctx_action = Some(ContextAction::SelectAll);   ui.close_menu(); }
@@ -7444,6 +7606,9 @@ fn render_panel(
                 // Konec tažení bez dropu - reset
                 if ui.input(|i| i.pointer.any_released()) && drag_src == &Some(which) {
                     *drag_src = None;
+                }
+                if panel.drag_out_done && !ui.input(|i| i.pointer.any_down()) {
+                    panel.drag_out_done = false;
                 }
 
             });
@@ -7676,6 +7841,227 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+// =====================================================================
+// Nativní tažení souborů do jiné aplikace (Linux / Wayland)
+// =====================================================================
+//
+// egui/winit umí soubory do okna jen přijímat, tažení ven samo nezačne.
+// Na Waylandu to ale jde udělat přímo: připojíme se jako "host" na stejné
+// Wayland spojení, které používá winit (wl_display z raw-window-handle),
+// vytvoříme si vlastní wl_pointer (dostává stejná tlačítková události jako
+// winit - potřebujeme z nich `serial` stisku) a vlastní wl_data_device.
+// Když tažení řádku opustí okno, zavoláme `start_drag` se sériovým číslem
+// stále drženého tlačítka a naším oknem (wl_surface) jako původem - od té
+// chvíle táhne soubor kompozitor (KWin/Mutter...) a cílová aplikace si
+// o data řekne přes wl_data_source.send (text/uri-list).
+//
+// Na X11 (a když cokoliv selže) zůstává záložní okénko `er-drag`.
+
+#[cfg(target_os = "linux")]
+mod native_dnd {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use wayland_backend::client::{Backend, ObjectId};
+    use wayland_client::globals::{registry_queue_init, GlobalListContents};
+    use wayland_client::protocol::{
+        wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_pointer,
+        wl_registry, wl_seat, wl_surface,
+    };
+    use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+
+    #[derive(Default)]
+    struct State {
+        /// Serial posledního stisku tlačítka myši v našem okně.
+        last_press_serial: Option<u32>,
+        /// Data pro cílovou aplikaci (text/uri-list).
+        payload: Vec<u8>,
+        /// Probíhá tažení (od start_drag do cancelled / dnd_finished).
+        active: bool,
+        /// Nabídky (schránka / tažení DO okna), které dostává náš data
+        /// device - nepoužíváme je, jen je průběžně uklízíme.
+        offers: Vec<wl_data_offer::WlDataOffer>,
+    }
+
+    pub struct NativeDnd {
+        conn: Connection,
+        queue: EventQueue<State>,
+        state: State,
+        ddm: wl_data_device_manager::WlDataDeviceManager,
+        device: wl_data_device::WlDataDevice,
+        surface: wl_surface::WlSurface,
+        _seat: wl_seat::WlSeat,
+        _pointer: wl_pointer::WlPointer,
+    }
+
+    impl NativeDnd {
+        /// Jen pro Wayland; na X11 vrací None (pak se použije okénko er-drag).
+        pub fn new(frame: &eframe::Frame) -> Option<Self> {
+            let display = match frame.display_handle().ok()?.as_raw() {
+                RawDisplayHandle::Wayland(h) => h.display.as_ptr(),
+                _ => return None,
+            };
+            let surface = match frame.window_handle().ok()?.as_raw() {
+                RawWindowHandle::Wayland(h) => h.surface.as_ptr(),
+                _ => return None,
+            };
+            match Self::init(display, surface) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("eR Commander: nativní tažení (Wayland) nedostupné: {}", e);
+                    None
+                }
+            }
+        }
+
+        fn init(display: *mut std::ffi::c_void, surface: *mut std::ffi::c_void) -> Result<Self, String> {
+            // Safety: wl_display i wl_surface patří winitu a žijí po celou
+            // dobu běhu okna (NativeDnd je součástí appky se stejnou životností).
+            let backend = unsafe { Backend::from_foreign_display(display as *mut _) };
+            let conn = Connection::from_backend(backend);
+            let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(|e| e.to_string())?;
+            let qh = queue.handle();
+            let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).map_err(|e| format!("wl_seat: {}", e))?;
+            let ddm: wl_data_device_manager::WlDataDeviceManager =
+                globals.bind(&qh, 1..=3, ()).map_err(|e| format!("wl_data_device_manager: {}", e))?;
+            let pointer = seat.get_pointer(&qh, ());
+            let device = ddm.get_data_device(&seat, &qh, ());
+            let surface_id = unsafe { ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface as *mut _) }
+                .map_err(|e| format!("wl_surface: {}", e))?;
+            let surface = wl_surface::WlSurface::from_id(&conn, surface_id).map_err(|e| format!("wl_surface: {}", e))?;
+            let mut state = State::default();
+            queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
+            Ok(Self { conn, queue, state, ddm, device, surface, _seat: seat, _pointer: pointer })
+        }
+
+        /// Zpracuje události, které mezitím přečetl winit (volat každý frame).
+        pub fn dispatch(&mut self) {
+            let _ = self.queue.dispatch_pending(&mut self.state);
+            let _ = self.conn.flush();
+        }
+
+        pub fn is_active(&self) -> bool {
+            self.state.active
+        }
+
+        /// Zahájí tažení - MUSÍ se volat, dokud je tlačítko myši stále
+        /// stisknuté (kompozitor ověřuje serial probíhajícího stisku).
+        pub fn start(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+            self.dispatch();
+            let serial = self.state.last_press_serial.ok_or("neznám serial stisku tlačítka")?;
+            self.state.payload = paths
+                .iter()
+                .map(|p| format!("{}\r\n", super::path_to_file_uri(p)))
+                .collect::<String>()
+                .into_bytes();
+            let qh = self.queue.handle();
+            let source = self.ddm.create_data_source(&qh, ());
+            source.offer("text/uri-list".to_string());
+            if source.version() >= 3 {
+                source.set_actions(wl_data_device_manager::DndAction::Copy);
+            }
+            self.device.start_drag(Some(&source), &self.surface, None, serial);
+            self.state.active = true;
+            self.conn.flush().map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+        fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event,
+                 _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<wl_seat::WlSeat, ()> for State {
+        fn event(_: &mut Self, _: &wl_seat::WlSeat, _: wl_seat::Event,
+                 _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<wl_pointer::WlPointer, ()> for State {
+        fn event(st: &mut Self, _: &wl_pointer::WlPointer, event: wl_pointer::Event,
+                 _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_pointer::Event::Button { serial, state: WEnum::Value(wl_pointer::ButtonState::Pressed), .. } = event {
+                st.last_press_serial = Some(serial);
+            }
+        }
+    }
+
+    impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for State {
+        fn event(_: &mut Self, _: &wl_data_device_manager::WlDataDeviceManager,
+                 _: wl_data_device_manager::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
+        fn event(st: &mut Self, _: &wl_data_device::WlDataDevice, event: wl_data_device::Event,
+                 _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_data_device::Event::DataOffer { id } = event {
+                st.offers.push(id);
+                // Nechceme je držet donekonečna - starší už nejsou aktuální.
+                while st.offers.len() > 4 {
+                    let old = st.offers.remove(0);
+                    old.destroy();
+                }
+            }
+        }
+
+        event_created_child!(State, wl_data_device::WlDataDevice, [
+            wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+        ]);
+    }
+
+    impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
+        fn event(_: &mut Self, _: &wl_data_offer::WlDataOffer, _: wl_data_offer::Event,
+                 _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<wl_data_source::WlDataSource, ()> for State {
+        fn event(st: &mut Self, source: &wl_data_source::WlDataSource, event: wl_data_source::Event,
+                 _: &(), _: &Connection, _: &QueueHandle<Self>) {
+            match event {
+                wl_data_source::Event::Send { fd, .. } => {
+                    let mut f = std::fs::File::from(fd);
+                    let _ = f.write_all(&st.payload);
+                }
+                wl_data_source::Event::Cancelled | wl_data_source::Event::DndFinished => {
+                    source.destroy();
+                    st.active = false;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Stub pro ostatní platformy (Windows zatím nic, X11 řeší er-drag okénko).
+#[cfg(not(target_os = "linux"))]
+mod native_dnd {
+    use std::path::PathBuf;
+    pub struct NativeDnd;
+    impl NativeDnd {
+        pub fn new(_frame: &eframe::Frame) -> Option<Self> { None }
+        pub fn dispatch(&mut self) {}
+        pub fn is_active(&self) -> bool { false }
+        pub fn start(&mut self, _paths: &[PathBuf]) -> Result<(), String> { Err("nepodporováno".into()) }
+    }
+}
+
+/// file:// URI pro text/uri-list (procentuální kódování všeho kromě
+/// nerezervovaných znaků a '/').
+fn path_to_file_uri(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    let mut out = String::from("file://");
+    for b in s.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || "-._~/".contains(c) {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

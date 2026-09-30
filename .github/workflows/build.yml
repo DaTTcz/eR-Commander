@@ -58,8 +58,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev
-      - name: cargo check
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libgtk-4-dev
+      - name: cargo check (Linux - včetně pomocníka er-drag)
+        if: runner.os == 'Linux'
+        run: cargo check --locked --workspace --all-targets
+      - name: cargo check (Windows - jen eR Commander)
+        if: runner.os == 'Windows'
         run: cargo check --locked --all-targets
       - name: cargo test
         if: runner.os == 'Linux'
@@ -129,12 +133,13 @@ jobs:
             ca-certificates curl wget git file build-essential pkg-config \
             libgtk-3-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev \
+            libgtk-4-dev
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Build (eR Commander + pomocník er-drag)
+        run: cargo build --release --locked --workspace --target x86_64-unknown-linux-gnu
       - name: Kontrola binárky
         run: |
           B="target/x86_64-unknown-linux-gnu/release/${BIN_NAME}"
@@ -145,16 +150,17 @@ jobs:
           [ "$OUT" = "eR Commander ${VERSION}" ] || { echo "::error::Binárka hlásí '$OUT', čekám verzi ${VERSION}"; exit 1; }
           mkdir -p dist
           cp "$B" dist/
-          chmod +x "dist/${BIN_NAME}"
+          cp target/x86_64-unknown-linux-gnu/release/er-drag dist/
+          chmod +x "dist/${BIN_NAME}" dist/er-drag
 
       - name: tar.gz (přenosná binárka)
-        run: tar -czf "${BIN_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C dist "${BIN_NAME}"
+        run: tar -czf "${BIN_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C dist "${BIN_NAME}" er-drag
 
       - name: AppImage
         run: |
           set -e
           mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
-          cp "dist/${BIN_NAME}" AppDir/usr/bin/
+          cp "dist/${BIN_NAME}" dist/er-drag AppDir/usr/bin/
           cp packaging/linux/eR_Commander.desktop AppDir/usr/share/applications/
           cp packaging/linux/eR_Commander.desktop AppDir/
           cp assets/app_icon.png AppDir/usr/share/icons/hicolor/256x256/apps/er-commander.png
