@@ -875,6 +875,72 @@ struct Bookmark {
     right: Option<PathBuf>,  // None = jednoduchá záložka
 }
 
+/// Skupina přípon se společnou barvou názvu souboru (Nastavení → Barvy).
+#[derive(Clone)]
+struct ColorGroup {
+    name:  String,
+    color: [u8; 3],
+    /// Přípony oddělené středníkem, např. "mkv;mp4;avi"
+    exts:  String,
+}
+
+/// Výchozí barva označených souborů.
+const DEFAULT_SEL_COLOR: [u8; 3] = [255, 200, 50];
+
+fn default_color_groups() -> Vec<ColorGroup> {
+    let g = |name: &str, color: [u8; 3], exts: &str| ColorGroup {
+        name: name.to_string(), color, exts: exts.to_string(),
+    };
+    vec![
+        g("Video",     [255, 150,  70], "mkv;mp4;avi;mov;wmv;flv;webm;m4v;mpg;mpeg;ts"),
+        g("Audio",     [110, 200, 255], "mp3;flac;wav;ogg;m4a;aac;opus;wma"),
+        g("Obrázky",   [120, 220, 120], "jpg;jpeg;png;gif;bmp;webp;svg;tif;tiff"),
+        g("Archivy",   [230, 110, 110], "zip;rar;7z;tar;gz;bz2;xz;iso"),
+        g("Dokumenty", [225, 205, 100], "pdf;doc;docx;odt;xls;xlsx;ods;ppt;pptx;txt;md"),
+    ]
+}
+
+/// Z přípon skupin (oddělených ; nebo ,) sestaví mapu přípona → barva.
+/// Přípony se porovnávají bez tečky a bez ohledu na velikost písmen.
+fn build_ext_colors(groups: &[ColorGroup]) -> std::collections::HashMap<String, egui::Color32> {
+    let mut map = std::collections::HashMap::new();
+    for g in groups {
+        let col = egui::Color32::from_rgb(g.color[0], g.color[1], g.color[2]);
+        for e in g.exts.split(|c| c == ';' || c == ',') {
+            let e = e.trim().trim_start_matches("*.").trim_start_matches('.').to_lowercase();
+            if !e.is_empty() {
+                map.entry(e).or_insert(col);
+            }
+        }
+    }
+    map
+}
+
+/// Načte skupiny barev ze stavového souboru. Pokud v něm ještě nejsou
+/// (starší verze), použijí se výchozí; po prvním uložení je soubor vždy
+/// obsahuje (i prázdný seznam = uživatel je záměrně smazal).
+fn load_color_groups() -> Vec<ColorGroup> {
+    let Ok(content) = fs::read_to_string(state_file_path()) else { return default_color_groups() };
+    if !content.lines().any(|l| l.starts_with("COLOR_GROUPS_SET=")) {
+        return default_color_groups();
+    }
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let Some(v) = line.strip_prefix("COLOR_GROUP=") else { continue };
+        let mut it = v.splitn(3, '|');
+        let (Some(name), Some(hex), Some(exts)) = (it.next(), it.next(), it.next()) else { continue };
+        let hex = hex.trim().trim_start_matches('#');
+        if hex.len() != 6 { continue; }
+        let Ok(n) = u32::from_str_radix(hex, 16) else { continue };
+        out.push(ColorGroup {
+            name: name.to_string(),
+            color: [(n >> 16) as u8, (n >> 8) as u8, n as u8],
+            exts: exts.to_string(),
+        });
+    }
+    out
+}
+
 fn load_state() -> (Option<PathBuf>, Option<PathBuf>, Vec<Bookmark>,
                     Option<SortColumn>, Option<SortDir>, Option<SortColumn>, Option<SortDir>,
                     bool) {
@@ -2844,6 +2910,10 @@ struct FileManagerApp {
     // Při F2/inline rename rovnou označit i příponu souboru (false = jen
     // název bez přípony, jako v Průzkumníku/Total Commanderu)
     rename_select_ext: bool,
+    color_groups: Vec<ColorGroup>,
+    /// Barva textu označených souborů (Nastavení → Vzhled)
+    sel_color: [u8; 3],
+    ext_colors: std::collections::HashMap<String, egui::Color32>,
 
     // Auto-update
     update_check_rx: Option<std::sync::mpsc::Receiver<Result<UpdateCheckResult, String>>>,
@@ -3007,6 +3077,8 @@ impl Default for FileManagerApp {
         if let Some(c) = sort_r_col { right_panel.sort_col = c; right_panel.refresh(); }
         if let Some(d) = sort_r_dir { right_panel.sort_dir = d; right_panel.refresh(); }
 
+        let color_groups_init = load_color_groups();
+
         // dir_sort načteme a aplikujeme na oba panely
         let saved_dir_sort = fs::read_to_string(state_file_path()).ok()
             .and_then(|c| c.lines()
@@ -3124,6 +3196,14 @@ impl Default for FileManagerApp {
                     .find(|l| l.starts_with("RENAME_SELECT_EXT="))
                     .map(|l| l["RENAME_SELECT_EXT=".len()..].trim() == "true"))
                 .unwrap_or(false),
+            color_groups: color_groups_init.clone(),
+            sel_color: fs::read_to_string(state_file_path()).ok()
+                .and_then(|c| c.lines()
+                    .find_map(|l| l.strip_prefix("SEL_COLOR=").map(|v| v.trim().trim_start_matches('#').to_string())))
+                .and_then(|h| if h.len() == 6 { u32::from_str_radix(&h, 16).ok() } else { None })
+                .map(|n| [(n >> 16) as u8, (n >> 8) as u8, n as u8])
+                .unwrap_or(DEFAULT_SEL_COLOR),
+            ext_colors: build_ext_colors(&color_groups_init),
             update_check_rx: None,
             update_state: UpdateState::Idle,
             show_update_dialog: false,
@@ -3774,6 +3854,14 @@ impl FileManagerApp {
             DirSort::FirstByCol  => "FirstByCol",
             DirSort::Mixed       => "Mixed",
         }));
+        content.push_str(&format!("SEL_COLOR={:02X}{:02X}{:02X}\n",
+            self.sel_color[0], self.sel_color[1], self.sel_color[2]));
+        content.push_str("COLOR_GROUPS_SET=1\n");
+        for g in &self.color_groups {
+            let clean = |t: &str| t.replace(['|', '\n', '\r'], " ");
+            content.push_str(&format!("COLOR_GROUP={}|{:02X}{:02X}{:02X}|{}\n",
+                clean(&g.name), g.color[0], g.color[1], g.color[2], clean(&g.exts)));
+        }
         for bm in &self.bookmarks {
             content.push_str(&format!("BM_NAME={}\n", bm.name));
             content.push_str(&format!("BM_LEFT={}\n", bm.left.display()));
@@ -4644,8 +4732,10 @@ impl eframe::App for FileManagerApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |columns| {
-                let (left_action,  left_ctx)  = render_panel(&mut columns[0], &mut self.left,  ActivePanel::Left,  &mut self.active, &mut self.drag_src);
-                let (right_action, right_ctx) = render_panel(&mut columns[1], &mut self.right, ActivePanel::Right, &mut self.active, &mut self.drag_src);
+                let (left_action,  left_ctx)  = render_panel(&mut columns[0], &mut self.left,  ActivePanel::Left,  &mut self.active, &mut self.drag_src, &self.ext_colors,
+                    egui::Color32::from_rgb(self.sel_color[0], self.sel_color[1], self.sel_color[2]));
+                let (right_action, right_ctx) = render_panel(&mut columns[1], &mut self.right, ActivePanel::Right, &mut self.active, &mut self.drag_src, &self.ext_colors,
+                    egui::Color32::from_rgb(self.sel_color[0], self.sel_color[1], self.sel_color[2]));
 
                 match left_action {
                     Some(PanelUiAction::OpenBookmarks) => self.open_bookmarks(ActivePanel::Left),
@@ -5795,15 +5885,31 @@ impl FileManagerApp {
     /// logo, přidej sem nahoru např. `ui.image(...)` s načteným obrázkem.
     fn render_settings_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_settings { return; }
-        dialog_tab_nav(ctx, self.dlg_tab, &[(egui::Id::new("settings_editor"), self.external_editor.chars().count())], true);
+        {
+            let mut fields: Vec<(egui::Id, usize)> = Vec::new();
+            for (i, g) in self.color_groups.iter().enumerate() {
+                fields.push((egui::Id::new(("cg_name", i)), g.name.chars().count()));
+                fields.push((egui::Id::new(("cg_exts", i)), g.exts.chars().count()));
+            }
+            fields.push((egui::Id::new("settings_editor"), self.external_editor.chars().count()));
+            dialog_tab_nav(ctx, self.dlg_tab, &fields, true);
+        }
         let mut changed = false;
+        let mut colors_changed = false;
+        // Výchozí velikost a poloha (střed obrazovky). Bez pivotu/kotvy, aby se
+        // okno při tažení za roh neposouvalo.
+        let settings_size = egui::vec2(720.0, (ctx.screen_rect().height() - 120.0).clamp(300.0, 720.0));
+        let settings_pos = ctx.screen_rect().center() - settings_size / 2.0;
 
         egui::Window::new("⚙ Nastavení")
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_pos(settings_pos)
             .collapsible(false)
-            .resizable(false)
-            .min_width(320.0)
+            .resizable(true)
+            .default_size(settings_size)
+            .min_width(380.0)
+            .min_height(240.0)
             .show(ctx, |ui| {
+              egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 // Téma
                 ui.group(|ui| {
                     ui.label(egui::RichText::new("Vzhled").strong());
@@ -5814,6 +5920,14 @@ impl FileManagerApp {
                         ui.selectable_value(&mut self.dark_mode, true,  "🌙 Tmavé");
                         ui.selectable_value(&mut self.dark_mode, false, "☀ Světlé");
                         if self.dark_mode != was { changed = true; }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Barva označených souborů:");
+                        if ui.color_edit_button_srgb(&mut self.sel_color).changed() { changed = true; }
+                        if ui.button("↺").on_hover_text("Výchozí barva").clicked() {
+                            self.sel_color = DEFAULT_SEL_COLOR;
+                            changed = true;
+                        }
                     });
                 });
 
@@ -5854,6 +5968,59 @@ impl FileManagerApp {
                         self.left.refresh();
                         self.right.refresh();
                     }
+                });
+
+                ui.add_space(8.0);
+
+                // Barvy názvů souborů podle přípony
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Barvy podle přípony").strong());
+                    ui.separator();
+                    let mut remove: Option<usize> = None;
+                    // Pole přípon vyplní zbytek šířky okna.
+                    let ext_w = (ui.available_width() - 160.0 - 50.0 - 40.0 - 40.0).max(220.0);
+                    egui::Grid::new("color_groups_grid").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
+                        ui.label(egui::RichText::new("Skupina").small());
+                        ui.label(egui::RichText::new("Barva").small());
+                        ui.label(egui::RichText::new("Přípony (oddělené ;)").small());
+                        ui.label("");
+                        ui.end_row();
+                        for (i, g) in self.color_groups.iter_mut().enumerate() {
+                            // add_sized: pevná šířka pole. Samotné desired_width se v Gridu
+                            // omezí na šířku sloupce z minulého snímku (tj. na hlavičku).
+                            if ui.add_sized([160.0, 22.0], egui::TextEdit::singleline(&mut g.name)
+                                .id(egui::Id::new(("cg_name", i)))
+                                .lock_focus(true)).changed() { colors_changed = true; }
+                            if ui.color_edit_button_srgb(&mut g.color).changed() { colors_changed = true; }
+                            if ui.add_sized([ext_w, 22.0], egui::TextEdit::singleline(&mut g.exts)
+                                .id(egui::Id::new(("cg_exts", i)))
+                                .lock_focus(true)
+                                .hint_text("mkv;mp4;avi")).changed() { colors_changed = true; }
+                            if ui.button("🗑").on_hover_text("Smazat skupinu").clicked() { remove = Some(i); }
+                            ui.end_row();
+                        }
+                    });
+                    if let Some(i) = remove {
+                        self.color_groups.remove(i);
+                        colors_changed = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("➕ Přidat skupinu").clicked() {
+                            self.color_groups.push(ColorGroup {
+                                name: "Nová skupina".to_string(),
+                                color: [120, 200, 255],
+                                exts: String::new(),
+                            });
+                            colors_changed = true;
+                        }
+                        if ui.button("↺ Výchozí").on_hover_text("Obnovit výchozí skupiny a barvy").clicked() {
+                            self.color_groups = default_color_groups();
+                            colors_changed = true;
+                        }
+                    });
+                    ui.label(egui::RichText::new(
+                        "Obarví název a příponu souboru. Příponu zadej bez tečky, více přípon odděl středníkem. U shodné přípony vyhrává první skupina.")
+                        .small().color(egui::Color32::GRAY));
                 });
 
                 ui.add_space(8.0);
@@ -5965,8 +6132,13 @@ impl FileManagerApp {
                 if ui.button("Zavřít").clicked() {
                     self.show_settings = false;
                 }
+              });
             });
 
+        if colors_changed {
+            self.ext_colors = build_ext_colors(&self.color_groups);
+            changed = true;
+        }
         if changed { self.save_state(); }
     }
 
@@ -7551,6 +7723,8 @@ fn render_panel(
     which: ActivePanel,
     active: &mut ActivePanel,
     drag_src: &mut Option<ActivePanel>,
+    ext_colors: &std::collections::HashMap<String, egui::Color32>,
+    sel_color: egui::Color32,
 ) -> (Option<PanelUiAction>, Option<ContextAction>) {
     let is_active = *active == which;
     let mut panel_action: Option<PanelUiAction> = None;
@@ -7877,7 +8051,7 @@ fn render_panel(
                 macro_rules! file_row {
                     ($idx:expr, $icon:expr, $stem:expr, $ext:expr, $size:expr,
                      $date:expr, $attr:expr, $sel:expr, $cur:expr) => {{                        // Pomocná funkce pro buňku s textem doleva a ořezem
-                        let cell_left = |ui: &mut egui::Ui, w: f32, text: &str, sel: bool, cur: bool| {
+                        let cell_left = |ui: &mut egui::Ui, w: f32, text: &str, sel: bool, cur: bool, tint: Option<egui::Color32>| {
                             let (rect, resp) = ui.allocate_exact_size(
                                 egui::vec2(w, H), egui::Sense::click());
                             if ui.is_rect_visible(rect) {
@@ -7886,7 +8060,8 @@ fn render_panel(
                                 if bg != egui::Color32::TRANSPARENT {
                                     ui.painter().rect_filled(rect, 2.0, bg);
                                 }
-                                let color = if sel { egui::Color32::from_rgb(255, 200, 50) }
+                                let color = if sel { sel_color }
+                                            else if let Some(t) = tint { t }
                                             else if cur { ui.visuals().strong_text_color() }
                                             else { ui.visuals().text_color() };
                                 let mut job = egui::text::LayoutJob::simple_singleline(
@@ -7914,7 +8089,7 @@ fn render_panel(
                                 if bg != egui::Color32::TRANSPARENT {
                                     ui.painter().rect_filled(rect, 2.0, bg);
                                 }
-                                let color = if sel { egui::Color32::from_rgb(255, 200, 50) }
+                                let color = if sel { sel_color }
                                             else if cur { ui.visuals().strong_text_color() }
                                             else { ui.visuals().text_color() };
                                 let mut job = egui::text::LayoutJob::simple_singleline(
@@ -7961,16 +8136,19 @@ fn render_panel(
                                 }
                             }
                             // název doleva + ořez
-                            cell_left(ui,  name_w, $stem,           $sel, $cur);
+                            // barva podle přípony (Nastavení → Barvy podle přípony)
+                            let ext_key: &str = $ext;
+                            let tint = if ext_key.is_empty() { None } else { ext_colors.get(ext_key).copied() };
+                            cell_left(ui,  name_w, $stem,           $sel, $cur, tint);
                             // přípona doleva
-                            cell_left(ui,  EXT_W,  $ext,            $sel, $cur);
+                            cell_left(ui,  EXT_W,  $ext,            $sel, $cur, tint);
                             // velikost doprava
                             let size_str: String = $size;
                             cell_right(ui, SIZE_W, &size_str,       $sel, $cur);
                             // datum doleva
-                            cell_left(ui,  DATE_W, $date,           $sel, $cur);
+                            cell_left(ui,  DATE_W, $date,           $sel, $cur, None);
                             // atribut doleva
-                            cell_left(ui,  ATTR_W, $attr,           $sel, $cur);
+                            cell_left(ui,  ATTR_W, $attr,           $sel, $cur, None);
                         });
 
                         let mut row_rect = row_resp.response.rect;
