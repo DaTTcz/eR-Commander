@@ -253,12 +253,26 @@ impl Panel {
             }
             self.path_input = loc.breadcrumb();
         } else {
-            if let Ok(read_dir) = fs::read_dir(&self.current_path) {
+            // Chyby výpisu NEzamlčujeme - dřív se při chybě čtení složky nebo
+            // metadat položky prostě ukázal prázdný panel (typicky NFS z
+            // TrueNAS: podsložky = samostatné ZFS datasety nebo bez práv pro
+            // naše UID, stat na nich selže, readdir ale jména vrátí).
+            match fs::read_dir(&self.current_path) {
+            Ok(read_dir) => {
+                let mut unreadable = 0usize;
+                let mut first_err: Option<String> = None;
                 let mut items: Vec<FileEntry> = read_dir
                     .flatten()
                     .filter_map(|entry| {
-                        let metadata = entry.metadata().ok()?;
                         let name = entry.file_name().to_string_lossy().into_owned();
+                        let metadata = match entry.metadata() {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                unreadable += 1;
+                                if first_err.is_none() { first_err = Some(e.to_string()); }
+                                None
+                            }
+                        };
 
                         // Filtrování skrytých/systémových souborů
                         if !self.show_hidden {
@@ -267,11 +281,19 @@ impl Panel {
                                 use std::os::windows::fs::MetadataExt;
                                 const HIDDEN: u32 = 0x2;
                                 const SYSTEM: u32 = 0x4;
-                                if metadata.file_attributes() & (HIDDEN | SYSTEM) != 0 { return None; }
+                                if let Some(m) = &metadata {
+                                    if m.file_attributes() & (HIDDEN | SYSTEM) != 0 { return None; }
+                                }
                             }
                         }
 
-                        let ext = if metadata.is_dir() {
+                        // Bez metadat aspoň typ položky z readdir (d_type) -
+                        // složka se pak dá i otevřít, jen bez velikosti/data.
+                        let is_dir = match &metadata {
+                            Some(m) => m.is_dir(),
+                            None => entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                        };
+                        let ext = if is_dir {
                             String::new()
                         } else {
                             Path::new(&name)
@@ -280,14 +302,14 @@ impl Panel {
                                 .unwrap_or_default()
                                 .to_string()
                         };
-                        let readonly = metadata.permissions().readonly();
-                        let modified = metadata.modified().ok();
+                        let readonly = metadata.as_ref().map(|m| m.permissions().readonly()).unwrap_or(false);
+                        let modified = metadata.as_ref().and_then(|m| m.modified().ok());
                         Some(FileEntry {
                             is_archive: matches!(ext.as_str(), "zip" | "rar" | "7z"),
                             name,
                             ext,
-                            is_dir: metadata.is_dir(),
-                            size: metadata.len(),
+                            is_dir,
+                            size: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
                             modified,
                             readonly,
                             dir_size: None,
@@ -297,6 +319,16 @@ impl Panel {
 
                 sort_entries_by(&mut items, self.sort_col, self.sort_dir, self.dir_sort);
                 self.entries = items;
+                if unreadable > 0 {
+                    self.error = Some(format!(
+                        "U {} položek nejdou načíst údaje (velikost/datum): {}",
+                        unreadable, first_err.unwrap_or_default()
+                    ));
+                }
+            }
+            Err(e) => {
+                self.error = Some(format!("Složku nelze načíst: {}", e));
+            }
             }
 
             let p = self.current_path.to_string_lossy().into_owned();
@@ -1050,6 +1082,79 @@ fn delete_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Po kolika bajtech se při zápisu na síťovou složku čeká na skutečné
+/// odeslání dat (viz flush_written).
+const NET_FLUSH_CHUNK: u64 = 16 * 1024 * 1024;
+
+/// Je cesta na síťovém souborovém systému? Linux: podle typu FS v
+/// /proc/mounts (nejdelší odpovídající přípojný bod; u autofs + NFS na
+/// stejném místě vyhraje to, co je připojené navrch, tedy NFS), plus
+/// cokoliv pod GVfs. Windows: UNC cesty (\\server\share).
+fn is_network_path(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    if s.contains("/gvfs/") || s.starts_with("\\\\") {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+            let mut best: Option<(usize, String)> = None;
+            for line in mounts.lines() {
+                let mut it = line.split_whitespace();
+                let (Some(_dev), Some(mp), Some(fstype)) = (it.next(), it.next(), it.next()) else { continue };
+                let mp = mp.replace("\\040", " ");
+                if p.starts_with(&mp) && best.as_ref().map_or(true, |(len, _)| mp.len() >= *len) {
+                    best = Some((mp.len(), fstype.to_string()));
+                }
+            }
+            if let Some((_, fstype)) = best {
+                return matches!(fstype.as_str(),
+                    "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "fuse.gvfsd-fuse" | "fuse.sshfs" | "9p");
+            }
+        }
+    }
+    false
+}
+
+/// Počká, až se právě zapsaný úsek souboru skutečně odešle (Linux:
+/// sync_file_range). Bez toho jádro u NFS/SMB přijme celý soubor do RAM
+/// během pár sekund - průběh skočí na 100 % - a skutečný přenos po síti
+/// pak proběhne až při zavření souboru, kdy se nic nehýbe ("0 / 3 souborů"
+/// při plných progress barech, ověřeno na /mnt/nas přes NFS). Na server
+/// se tím NEvynucuje zápis na disk (žádný fsync), jen odeslání dat.
+fn flush_written(file: &fs::File, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                offset as libc::off64_t,
+                len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, offset, len);
+    }
+}
+
+/// Vytvoří cílový soubor pro kopírování. Na síťové složce přes GVfs
+/// (SMB/NFS v /run/user/.../gvfs) existující soubor nejdřív smaže: GVfs
+/// přepis existujícího souboru dělá přes dočasný `.giosave*` a záměnu,
+/// což na NFS z TrueNAS končilo "Input/output error (os error 5)"
+/// (ověřeno při "Přepsat vše" u nedokončeného souboru po zaseknutí).
+fn create_dst_file(dst: &Path) -> std::io::Result<fs::File> {
+    if dst.to_string_lossy().contains("/gvfs/") && dst.is_file() {
+        fs::remove_file(dst)?;
+    }
+    fs::File::create(dst)
+}
+
 /// Spustí operaci na pozadí. Vrátí (Receiver, OpFlag) kde OpFlag
 /// slouží pro pause/resume/stop z UI vlákna.
 fn spawn_file_op(
@@ -1074,7 +1179,16 @@ fn spawn_file_op(
 
     thread::spawn(move || {
         let total        = files.len();
-        let num_threads  = 4.min(total).max(1);
+        // Síťové složky přes GVfs (SMB/NFS v /run/user/.../gvfs): jen jedno
+        // vlákno. GVfs zapisuje přes FUSE do dočasných `.giosaveXXXXXX`
+        // souborů a se 4 souběžnými zápisy na NFS se zaseklo (ověřeno na
+        // trubka-nb: 3 soubory stály na 0 B, zůstaly prázdné .giosave*).
+        // Spojení na server je beztak jedno, paralelismus by nic nezrychlil.
+        // Totéž platí pro jakoukoliv síťovou složku (jádrové NFS/SMB z
+        // /etc/fstab, GVfs...) - spojení na server je jedno.
+        let network = dst_dir.as_deref().map_or(false, is_network_path)
+            || files.iter().any(|f| is_network_path(f));
+        let num_threads  = if network { 1 } else { 4.min(total).max(1) };
         let done_counter = Arc::new(AtomicUsize::new(0));
         let bytes_global = Arc::new(AtomicU64::new(0));
         let tx           = Arc::new(std::sync::Mutex::new(tx));
@@ -1137,8 +1251,9 @@ fn spawn_file_op(
                             (|| -> std::io::Result<()> {
                                 use std::io::{Read, Write};
                                 let mut src_file = fs::File::open(src)?;
-                                let mut dst_file = fs::File::create(&dst)?;
+                                let mut dst_file = create_dst_file(&dst)?;
                                 let mut buf = vec![0u8; 256 * 1024];
+                                let (mut written, mut synced) = (0u64, 0u64);
                                 loop {
                                     if flag_thread.load(Ordering::Relaxed) == OP_STOP {
                                         break;
@@ -1149,6 +1264,11 @@ fn spawn_file_op(
                                     let n = src_file.read(&mut buf)?;
                                     if n == 0 { break; }
                                     dst_file.write_all(&buf[..n])?;
+                                    written += n as u64;
+                                    if network && written - synced >= NET_FLUSH_CHUNK {
+                                        flush_written(&dst_file, synced, written - synced);
+                                        synced = written;
+                                    }
                                     let bytes = bytes_global.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
                                     if let Ok(t) = tx.lock() {
                                         let _ = t.send(OpMsg::SlotProgress {
@@ -1194,8 +1314,9 @@ fn spawn_file_op(
                                     } else {
                                         use std::io::{Read, Write};
                                         let mut src_file = fs::File::open(src)?;
-                                        let mut dst_file = fs::File::create(&dst)?;
+                                        let mut dst_file = create_dst_file(&dst)?;
                                         let mut buf = vec![0u8; 256 * 1024];
+                                        let (mut written, mut synced) = (0u64, 0u64);
                                         loop {
                                             if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
                                             while flag_thread.load(Ordering::Relaxed) == OP_PAUSE {
@@ -1204,6 +1325,11 @@ fn spawn_file_op(
                                             let n = src_file.read(&mut buf)?;
                                             if n == 0 { break; }
                                             dst_file.write_all(&buf[..n])?;
+                                            written += n as u64;
+                                            if network && written - synced >= NET_FLUSH_CHUNK {
+                                                flush_written(&dst_file, synced, written - synced);
+                                                synced = written;
+                                            }
                                             let bytes = bytes_global.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
                                             if let Ok(t) = tx.lock() {
                                                 let _ = t.send(OpMsg::SlotProgress { thread_id, bytes_copied: n as u64 });
@@ -1601,6 +1727,13 @@ fn spawn_search(root: PathBuf, name_pattern: String, content_pattern: String) ->
     rx
 }
 
+/// Doba ve tvaru "m:ss" (do hodiny) nebo "h:mm:ss".
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 { format!("{}:{:02}:{:02}", h, m, s) } else { format!("{}:{:02}", m, s) }
+}
+
 fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -1631,8 +1764,30 @@ enum PendingAction {
     },
 }
 
-/// Vykreslí SVG ikonku. Každá ikonka MUSÍ mít unikátní `uri` (klíč pro cache egui).
-/// Bez toho by egui cachoval první ikonku a zobrazoval ji pro všechny.
+/// Zkrátí text uprostřed ("Začátek…konec.mkv"), aby se vešel do `max_w`
+/// bodů ve výchozím písmu labelu. Konec (přípona) zůstane vždy vidět.
+fn shorten_middle(ui: &egui::Ui, text: &str, max_w: f32) -> String {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let width = |t: &str| -> f32 {
+        ui.fonts(|f| f.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+    };
+    if width(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let tail_len = 12.min(n / 2);
+    let tail: String = chars[n - tail_len..].iter().collect();
+    // Největší počet znaků začátku, se kterým se to ještě vejde.
+    let (mut lo, mut hi) = (0usize, n - tail_len);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let cand = format!("{}…{}", chars[..mid].iter().collect::<String>(), tail);
+        if width(&cand) <= max_w { lo = mid; } else { hi = mid - 1; }
+    }
+    format!("{}…{}", chars[..lo].iter().collect::<String>(), tail)
+}
+
 /// Unicode ikonky - fungují spolehlivě s jakýmkoliv egui fontem,
 /// bez cache problémů nebo API zádrhelů při načítání SVG.
 struct Icons;
@@ -1771,7 +1926,9 @@ fn resolve_gvfs_mount_path(protocol: NetShareProtocol, server: &str, share: &str
 
     let exact_prefix = match protocol {
         NetShareProtocol::Smb => format!("smb-share:server={},share={}", server, share),
-        NetShareProtocol::Nfs => format!("server={},export=", server),
+        // Ověřeno na trubka-nb: "nfs:host=192.168.1.2,prefix=%2Fmnt%2FDISK1%2FVIDEO"
+        NetShareProtocol::Nfs => format!("nfs:host={},prefix=%2f{}", server,
+            share.trim_matches('/').replace('/', "%2f")),
     };
 
     // Porovnáváme bez ohledu na velikost písmen - GVfs jméno sdílení
@@ -1789,7 +1946,8 @@ fn resolve_gvfs_mount_path(protocol: NetShareProtocol, server: &str, share: &str
         let exact = match protocol {
             // "share=video" nesmí chytit i "share=video2"
             NetShareProtocol::Smb => name == exact_prefix || name.starts_with(&format!("{},", exact_prefix)),
-            NetShareProtocol::Nfs => name.starts_with(&exact_prefix),
+            // Přesně - "prefix=%2fmnt%2fdisk1%2fvideo" nesmí chytit "...video2"
+            NetShareProtocol::Nfs => name == exact_prefix || name.starts_with(&format!("{},", exact_prefix)),
         };
         if exact {
             return Some(entry.path());
@@ -2380,7 +2538,20 @@ fn gio_mount_worker(
 
     let url = format!("{}://{}/{}", protocol.scheme(), server, share);
     let answers: [&str; 3] = if anonymous { ["", "", ""] } else { [&user, &domain, &password] };
-    let mount_result = run_gio_mount(&url, answers);
+    let mut mount_result = run_gio_mount(&url, answers);
+
+    // "Umístění je již připojeno", ale mount bod v /run/user/.../gvfs
+    // neexistuje - GVfs si připojení pamatuje, jenže jeho FUSE část (to,
+    // co dělá z připojení obyčejnou složku) mezitím spadla nebo byla
+    // ukončena (např. `pkill gvfsd-fuse`). Odpojíme a připojíme znovu.
+    if let Err(e) = &mount_result {
+        let l = e.to_lowercase();
+        let already = l.contains("již připojeno") || l.contains("already mounted");
+        if already && resolve_gvfs_mount_path(protocol, &server, &share).is_none() {
+            let _ = std::process::Command::new("gio").arg("mount").arg("-u").arg(&url).output();
+            mount_result = run_gio_mount(&url, answers);
+        }
+    }
 
     // Z výpisu `gio mount -l` jen síťová připojení (řádky s "://") -
     // lokální disky (UDisks2) sem nepatří a jen zahlcovaly chybovou hlášku.
@@ -2768,6 +2939,7 @@ struct FileManagerApp {
     native_dnd_init: bool,
     /// Poslat egui syntetické puštění tlačítka (viz start_drag_out).
     synth_release: bool,
+    title_set: bool,
     /// Tab (+1) / Shift+Tab (-1) stisknutý v tomto framu, když je otevřený
     /// dialog - viz `dialog_tab_nav`.
     dlg_tab: i8,
@@ -2782,6 +2954,18 @@ struct FileManagerApp {
     /// Vybraná záložka v dialogu záložek (šipky ↑↓, Enter = přejít).
     bm_sel: usize,
     bm_scroll: bool,
+    /// Kdy ještě jednou načíst panely na síťové (GVfs) složce - viz refresh_both.
+    gvfs_refresh_at: Vec<std::time::Instant>,
+    /// Zjišťování velikosti zapisovaných souborů na pozadí (poll_fs_events).
+    fs_stat_rx: Option<Receiver<Vec<(PathBuf, u64, Option<SystemTime>)>>>,
+    fs_touched_pending: std::collections::HashSet<PathBuf>,
+    /// Okno průběhu: začátek operace, vzorky (čas, bajty) pro rychlost,
+    /// doba strávená v pauze, celková doba po dokončení.
+    op_started: Option<std::time::Instant>,
+    op_finished_after: Option<std::time::Duration>,
+    op_samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    op_paused_total: std::time::Duration,
+    op_pause_since: Option<std::time::Instant>,
 
     // Dialog "Odpojit síťovou složku" - výběr z aktuálně připojených GVfs
     // sdílení (zobrazený název, kořen mount bodu), `unmount_sel` = vybraný řádek.
@@ -3002,6 +3186,7 @@ impl Default for FileManagerApp {
             native_dnd: None,
             native_dnd_init: false,
             synth_release: false,
+            title_set: false,
             dlg_tab: 0,
             bm_focus_pending: false,
             search_focus_pending: false,
@@ -3009,6 +3194,14 @@ impl Default for FileManagerApp {
             rename_focus_pending: false,
             bm_sel: 0,
             bm_scroll: false,
+            gvfs_refresh_at: Vec::new(),
+            fs_stat_rx: None,
+            fs_touched_pending: std::collections::HashSet::new(),
+            op_started: None,
+            op_finished_after: None,
+            op_samples: std::collections::VecDeque::new(),
+            op_paused_total: std::time::Duration::ZERO,
+            op_pause_since: None,
             show_unmount_dialog: false,
             unmount_list: Vec::new(),
             unmount_sel: 0,
@@ -3050,6 +3243,53 @@ impl FileManagerApp {
     fn refresh_both(&mut self) {
         self.left.refresh();
         self.right.refresh();
+        // Síťové složky (GVfs: SMB/NFS přes /run/user/.../gvfs) si údaje
+        // o souborech chvíli drží v mezipaměti - hned po dopsání souboru
+        // vrátí ještě starou velikost (ověřeno: NFS z TrueNAS ukazoval
+        // 256 KB místo 795 MB, správně až po novém připojení). Panely na
+        // síťové složce proto načteme ještě dvakrát se zpožděním.
+        let is_gvfs = |p: &Panel| p.current_path.to_string_lossy().contains("/gvfs/");
+        if is_gvfs(&self.left) || is_gvfs(&self.right) {
+            let now = std::time::Instant::now();
+            self.gvfs_refresh_at = vec![
+                now + std::time::Duration::from_secs(2),
+                now + std::time::Duration::from_secs(6),
+            ];
+        }
+    }
+
+    /// Odložené doplnění velikostí na síťových panelech (viz refresh_both).
+    /// Záměrně NEnačítá celou složku znovu - u pomalé síťové složky by to
+    /// pokaždé zablokovalo okno. Jen znovu zjistí velikost a čas souborů
+    /// změněných v posledních 15 minutách (= právě dokopírovaných), výběr
+    /// ani kurzor se nemění.
+    fn poll_gvfs_refresh(&mut self, ctx: &egui::Context) {
+        if self.gvfs_refresh_at.is_empty() { return; }
+        let now = std::time::Instant::now();
+        if self.gvfs_refresh_at[0] <= now {
+            self.gvfs_refresh_at.remove(0);
+            let recent = std::time::SystemTime::now() - std::time::Duration::from_secs(15 * 60);
+            for panel in [&mut self.left, &mut self.right] {
+                if !panel.current_path.to_string_lossy().contains("/gvfs/")
+                    || panel.archive_location.is_some() || panel.net_location.is_some()
+                {
+                    continue;
+                }
+                let dir = panel.current_path.clone();
+                for entry in panel.entries.iter_mut() {
+                    if entry.is_dir || entry.modified.map_or(true, |m| m < recent) {
+                        continue;
+                    }
+                    if let Ok(meta) = fs::metadata(dir.join(&entry.name)) {
+                        entry.size = meta.len();
+                        entry.modified = meta.modified().ok();
+                    }
+                }
+            }
+        }
+        if let Some(next) = self.gvfs_refresh_at.first() {
+            ctx.request_repaint_after(next.saturating_duration_since(now));
+        }
     }
 
     /// Centralizovaný start operace - nastaví všechna progress pole a otevře dialog.
@@ -3065,6 +3305,11 @@ impl FileManagerApp {
         self.op_skipped     = 0;
         self.op_errors      = Vec::new();
         self.op_slots       = vec![None; threads];
+        self.op_started        = Some(std::time::Instant::now());
+        self.op_finished_after = None;
+        self.op_samples.clear();
+        self.op_paused_total   = std::time::Duration::ZERO;
+        self.op_pause_since    = None;
         self.op_status = Some(StatusMsg::Info(format!("{}...", label)));
         self.show_progress  = true;
         self.op_err_wait    = None;
@@ -3386,25 +3631,59 @@ impl FileManagerApp {
             }
         }
 
+        // Během naší vlastní operace (kopírování/přesun/mazání) události
+        // ignorujeme - oba panely se stejně načtou po jejím skončení. Hlavně
+        // ale: `stat` na soubor, do kterého se právě zapisuje, na NFS
+        // (jádrový klient) čeká, až se na server odešlou VŠECHNA rozepsaná
+        // data - okno pak "neodpovídá" po celou dobu kopírování (ověřeno na
+        // trubka-nb, /mnt/nas přes fstab).
+        if self.op_rx.is_some() {
+            return;
+        }
+
         if refresh_left  { self.left.refresh(); }
         if refresh_right { self.right.refresh(); }
 
-        for path in touched {
-            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { continue };
-            let name = name.to_string_lossy();
-            for panel in [&mut self.left, &mut self.right] {
-                if panel.archive_location.is_some() || panel.net_location.is_some()
-                    || panel.current_path != parent
-                {
-                    continue;
-                }
-                if let Some(entry) = panel.entries.iter_mut().find(|e| e.name == name) {
-                    if let Ok(meta) = fs::metadata(&path) {
-                        entry.size = meta.len();
-                        entry.modified = meta.modified().ok();
+        // Velikost/čas zapisovaných souborů zjišťujeme na pozadí - ze stejného
+        // důvodu (stat na síťové složce může trvat dlouho). Výsledky si
+        // vyzvedne poll_fs_stats v dalších framech.
+        self.fs_touched_pending.extend(touched);
+        if self.fs_stat_rx.is_none() && !self.fs_touched_pending.is_empty() {
+            let paths: Vec<PathBuf> = self.fs_touched_pending.drain().collect();
+            let (tx, rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let results: Vec<(PathBuf, u64, Option<SystemTime>)> = paths.into_iter()
+                    .filter_map(|p| fs::metadata(&p).ok().map(|m| (p, m.len(), m.modified().ok())))
+                    .collect();
+                let _ = tx.send(results);
+            });
+            self.fs_stat_rx = Some(rx);
+        }
+    }
+
+    /// Dosadí do panelů velikosti/časy zjištěné na pozadí (viz poll_fs_events).
+    fn poll_fs_stats(&mut self) {
+        let Some(rx) = self.fs_stat_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(results) => {
+                for (path, size, modified) in results {
+                    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { continue };
+                    let name = name.to_string_lossy();
+                    for panel in [&mut self.left, &mut self.right] {
+                        if panel.archive_location.is_some() || panel.net_location.is_some()
+                            || panel.current_path != parent
+                        {
+                            continue;
+                        }
+                        if let Some(entry) = panel.entries.iter_mut().find(|e| e.name == name) {
+                            entry.size = size;
+                            entry.modified = modified;
+                        }
                     }
                 }
             }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.fs_stat_rx = Some(rx),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
 
@@ -3524,6 +3803,14 @@ impl FileManagerApp {
             }
         }
 
+        // Zapisujeme jen při změně - dřív se soubor přepisoval v každém
+        // snímku, což dělalo zbytečnou zátěž a (při domovské složce v panelu)
+        // spouštělo fs watcher dokola.
+        static LAST_WINDOW_STATE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        if let Ok(mut last) = LAST_WINDOW_STATE.lock() {
+            if *last == content { return; }
+            *last = content.clone();
+        }
         let path = dirs_home().join(".er_commander_window.txt");
         let _ = fs::write(path, content);
     }
@@ -3552,6 +3839,43 @@ impl FileManagerApp {
             || self.show_text_editor
             || self.show_net_mount
             || self.show_unmount_dialog
+    }
+
+    /// Nastaví panel `to` na stejné umístění, jaké má panel `from` - včetně
+    /// síťové složky, virtuálního výpisu "Síť" i procházení ZIP archivu.
+    /// Kurzor v cílovém panelu se postaví na položku, na které stojí zdroj.
+    fn copy_location(&mut self, from: ActivePanel, to: ActivePanel) {
+        if from == to { return; }
+        let (src, dst) = match from {
+            ActivePanel::Left  => (&self.left, &mut self.right),
+            ActivePanel::Right => (&self.right, &mut self.left),
+        };
+        let cursor_name = src.entry_index_at_cursor()
+            .and_then(|i| src.entries.get(i))
+            .map(|e| e.name.clone());
+        dst.current_path     = src.current_path.clone();
+        dst.archive_location = src.archive_location.clone();
+        dst.net_location     = src.net_location.clone();
+        dst.refresh();
+        dst.cursor = 0;
+        if let Some(name) = cursor_name {
+            if let Some(idx) = dst.entries.iter().position(|e| e.name == name) {
+                dst.cursor = idx + dst.up_offset();
+            }
+        }
+        dst.cursor_moved = true;
+    }
+
+    /// Prohodí umístění levého a pravého panelu (Ctrl+U, jako Total Commander).
+    fn swap_locations(&mut self) {
+        std::mem::swap(&mut self.left.current_path, &mut self.right.current_path);
+        std::mem::swap(&mut self.left.archive_location, &mut self.right.archive_location);
+        std::mem::swap(&mut self.left.net_location, &mut self.right.net_location);
+        std::mem::swap(&mut self.left.cursor, &mut self.right.cursor);
+        self.left.refresh();
+        self.right.refresh();
+        self.left.cursor_moved = true;
+        self.right.cursor_moved = true;
     }
 
     /// Otevře dialog záložek. `target` říká, do kterého panelu se má
@@ -3781,6 +4105,59 @@ impl FileManagerApp {
         // Snapshot slotů pro render (ať nemusíme borrowit self uvnitř closure)
         let slots_snap: Vec<Option<FileSlot>> = self.op_slots.clone();
 
+        // ── Rychlost, uplynulý a zbývající čas ───────────────────────────
+        // Rychlost = klouzavý průměr za posledních ~5 s (vzorky bajtů v čase),
+        // ať číslo neposkakuje. Pauza se do času nepočítá a po ní se měření
+        // rychlosti začne znovu.
+        let now = std::time::Instant::now();
+        if is_running {
+            if is_paused {
+                if self.op_pause_since.is_none() { self.op_pause_since = Some(now); }
+            } else if let Some(since) = self.op_pause_since.take() {
+                self.op_paused_total += now - since;
+                self.op_samples.clear();
+            }
+            if !is_paused && self.op_samples.back().map_or(true, |(t, _)| now - *t >= std::time::Duration::from_millis(200)) {
+                self.op_samples.push_back((now, self.op_bytes_done));
+            }
+            while self.op_samples.front().map_or(false, |(t, _)| now - *t > std::time::Duration::from_secs(5)) {
+                self.op_samples.pop_front();
+            }
+        }
+        let paused_now = self.op_pause_since.map_or(std::time::Duration::ZERO, |t| now - t);
+        let elapsed = self.op_started
+            .map(|t| now.saturating_duration_since(t).saturating_sub(self.op_paused_total + paused_now))
+            .unwrap_or_default();
+        if !is_running && self.op_started.is_some() && self.op_finished_after.is_none() {
+            self.op_finished_after = Some(elapsed);
+        }
+        let speed_line: Option<String> = if self.op_bytes_total == 0 {
+            None
+        } else if let Some(total_time) = self.op_finished_after {
+            let secs = total_time.as_secs_f64().max(0.001);
+            Some(format!("Hotovo za {} · průměrně {}/s",
+                format_duration(total_time),
+                format_size((self.op_bytes_done as f64 / secs) as u64)))
+        } else if is_paused {
+            Some(format!("Pozastaveno · uplynulo {}", format_duration(elapsed)))
+        } else {
+            let speed = match (self.op_samples.front(), self.op_samples.back()) {
+                (Some((t0, b0)), Some((t1, b1))) if *t1 - *t0 >= std::time::Duration::from_millis(1000) =>
+                    Some(b1.saturating_sub(*b0) as f64 / (*t1 - *t0).as_secs_f64()),
+                _ => None,
+            };
+            Some(match speed {
+                Some(sp) if sp > 1.0 => {
+                    let remaining = self.op_bytes_total.saturating_sub(self.op_bytes_done) as f64;
+                    format!("Rychlost {}/s · uplynulo {} · zbývá ~{}",
+                        format_size(sp as u64),
+                        format_duration(elapsed),
+                        format_duration(std::time::Duration::from_secs_f64(remaining / sp)))
+                }
+                _ => format!("Uplynulo {} · měřím rychlost…", format_duration(elapsed)),
+            })
+        };
+
         egui::Window::new(format!("{} – průběh", self.op_kind_label))
             .collapsible(false)
             .resizable(true)
@@ -3797,16 +4174,10 @@ impl FileManagerApp {
                         let frac = if slot.size > 0 {
                             slot.copied as f32 / slot.size as f32
                         } else { 1.0 };
-                        ui.horizontal(|ui| {
-                            // Zkrácené jméno souboru - unicode-safe přes chars()
-                            let chars: Vec<char> = slot.file.chars().collect();
-                            let name = if chars.len() > 34 {
-                                format!("...{}", &chars[chars.len()-31..].iter().collect::<String>())
-                            } else {
-                                slot.file.clone()
-                            };
-                            ui.label(egui::RichText::new(&name).monospace().small());
-                        });
+                        // Celé jméno souboru; když se nevejde do šířky pruhu (440),
+                        // ořízne se uprostřed, ať zůstane vidět přípona.
+                        let name = shorten_middle(ui, &slot.file, 440.0);
+                        ui.label(name);
                         ui.add(egui::ProgressBar::new(frac)
                             .text(if slot.size > 0 {
                                 format!("{} / {}", format_size(slot.copied), format_size(slot.size))
@@ -3834,6 +4205,9 @@ impl FileManagerApp {
                         .text(format!("{} / {}", format_size(self.op_bytes_done),
                                                   format_size(self.op_bytes_total)))
                         .desired_width(440.0));
+                }
+                if let Some(line) = &speed_line {
+                    ui.label(line.as_str());
                 }
 
                 // ── Statistiky ────────────────────────────────────────────
@@ -4179,8 +4553,13 @@ impl eframe::App for FileManagerApp {
         }
 
         // Verze v title baru
-        let title = format!("eR Commander v{}", env!("CARGO_PKG_VERSION"));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        // Jen jednou - každý ViewportCommand vynutí další překreslení, takže
+        // posílání v každém snímku drželo appku na 60 fps i v klidu.
+        if !self.title_set {
+            self.title_set = true;
+            let title = format!("eR Commander v{}", env!("CARGO_PKG_VERSION"));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
 
         self.render_menu_bar(ctx);
 
@@ -4374,15 +4753,29 @@ impl eframe::App for FileManagerApp {
         self.poll_update_check();
         self.render_update_dialog(ctx);
         self.poll_net_mount();
+        self.poll_gvfs_refresh(ctx);
+        self.poll_fs_stats();
+        if self.fs_stat_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         self.render_net_mount_dialog(ctx);
         self.render_unmount_dialog(ctx);
         self.poll_net_browse();
 
         // Barevné téma
-        if self.dark_mode {
-            ctx.set_visuals(egui::Visuals::dark());
-        } else {
-            ctx.set_visuals(egui::Visuals::light());
+        // Jen při změně - set_visuals v každém snímku nutí egui k neustálému
+        // překreslování (60 fps v klidu, ventilátory naplno).
+        {
+            use std::sync::atomic::{AtomicI8, Ordering as AO};
+            static APPLIED: AtomicI8 = AtomicI8::new(-1);
+            let want = if self.dark_mode { 1 } else { 0 };
+            if APPLIED.swap(want, AO::Relaxed) != want {
+                if self.dark_mode {
+                    ctx.set_visuals(egui::Visuals::dark());
+                } else {
+                    ctx.set_visuals(egui::Visuals::light());
+                }
+            }
         }
 
         // Uložíme stav jen tehdy, když se cesta v některém panelu skutečně
@@ -4403,7 +4796,39 @@ impl eframe::App for FileManagerApp {
         // vestavěnou navigací egui. Díky tomu šipky/Enter/Space spolehlivě
         // patří jen seznamu souborů, nikdy ne tlačítkům okolo.
         if self.op_rx.is_some() || self.search_rx.is_some() || self.dir_size_rx.is_some() || self.net_mount_rx.is_some() || self.net_browse_rx.is_some() {
-            ctx.request_repaint();
+            // Ne každý snímek naplno (to zatěžuje CPU/GPU a roztáčí
+            // ventilátory), ~20 fps na průběh stačí.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // Diagnostika: ERC_DEBUG=1 ./er-commander -> každou sekundu vypíše
+        // počet snímků a které "důvody k překreslování" jsou aktivní.
+        if std::env::var_os("ERC_DEBUG").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering as AO};
+            use std::sync::Mutex;
+            static FRAMES: AtomicU32 = AtomicU32::new(0);
+            static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+            FRAMES.fetch_add(1, AO::Relaxed);
+            if let Ok(mut last) = LAST.lock() {
+                let now = std::time::Instant::now();
+                let t0 = *last.get_or_insert(now);
+                if now.duration_since(t0).as_secs_f32() >= 1.0 {
+                    eprintln!(
+                        "[ERC_DEBUG] fps={} op={} search={} dirsize={} netmount={} netbrowse={} fsstat={} gvfs={} dnd={} progress={} evts={}",
+                        FRAMES.swap(0, AO::Relaxed),
+                        self.op_rx.is_some(), self.search_rx.is_some(), self.dir_size_rx.is_some(),
+                        self.net_mount_rx.is_some(), self.net_browse_rx.is_some(), self.fs_stat_rx.is_some(),
+                        self.gvfs_refresh_at.len(),
+                        self.native_dnd.as_ref().map_or(false, |d| d.is_active()),
+                        self.show_progress,
+                        ctx.input(|i| i.events.len()),
+                    );
+                    for c in ctx.repaint_causes() {
+                        eprintln!("[ERC_DEBUG]   příčina překreslení: {}", c);
+                    }
+                    *last = Some(now);
+                }
+            }
         }
 
         // Reset cursor_moved KONEC framu - scroll proběhl, příští frame scrollovat nebudeme
@@ -4654,6 +5079,14 @@ impl FileManagerApp {
         let ctrl_a = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::A));
         let alt_c  = ctx.input(|i| i.modifiers.alt && !i.modifiers.ctrl && i.key_pressed(egui::Key::C));
         let ctrl_h = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H));
+        // Ctrl+← / Ctrl+→ = levý / pravý panel dostane složku druhého panelu
+        // (jako Total Commander), Ctrl+U = prohodit složky obou panelů.
+        let (ctrl_left, ctrl_right, ctrl_u) = ctx.input(|i| {
+            let c = i.modifiers.command && !i.modifiers.shift && !i.modifiers.alt;
+            (c && i.key_pressed(egui::Key::ArrowLeft),
+             c && i.key_pressed(egui::Key::ArrowRight),
+             c && i.key_pressed(egui::Key::U))
+        });
         let f2 = f2 || f2_key;
 
         // ── F klávesy ────────────────────────────────────────────────────
@@ -4725,6 +5158,9 @@ impl FileManagerApp {
             if f4     { self.open_external_editor(); }
             if alt_f5 { self.start_zip_pack(); }
             if ctrl_h { self.open_hash_dialog(); }
+            if ctrl_left  { self.copy_location(ActivePanel::Right, ActivePanel::Left); }
+            if ctrl_right { self.copy_location(ActivePanel::Left, ActivePanel::Right); }
+            if ctrl_u     { self.swap_locations(); }
             if ctrl_a {
                 let panel = self.active_panel_mut();
                 panel.selected = (0..panel.entries.len()).collect();
@@ -5130,6 +5566,9 @@ impl FileManagerApp {
                         ui.separator(); ui.separator(); ui.end_row();
                         cmd!("Zabalit do ZIP",        "Alt+F5",  self.start_zip_pack());
                         cmd!("Najít soubory/text",    "Alt+F7 / Ctrl+F",  self.open_search_dialog());
+                        cmd!("Levý panel ← složka pravého",  "Ctrl+←",  self.copy_location(ActivePanel::Right, ActivePanel::Left));
+                        cmd!("Pravý panel → složka levého",  "Ctrl+→",  self.copy_location(ActivePanel::Left, ActivePanel::Right));
+                        cmd!("Prohodit panely",       "Ctrl+U",  self.swap_locations());
                         cmd!("Hromadné přejmenování", "Ctrl+M",  { self.rename_error = None; self.show_rename_dialog = true; self.rename_focus_pending = true; });
                         cmd!("Kontrolní součet",      "Ctrl+H",  self.open_hash_dialog());
                         cmd!("Nový soubor",           "Ctrl+N",  { self.new_file_name = "novy_soubor.txt".to_string(); self.new_file_error = None; self.show_new_file = true; });
