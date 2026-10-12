@@ -184,6 +184,9 @@ struct Panel {
     /// Tažení právě opustilo okno a předalo se pomocníkovi er-drag -
     /// do puštění tlačítka myši už znovu nespouštět.
     drag_out_done: bool,
+    /// Volné/celkové místo disku panelu (zjišťuje se na pozadí, viz disk_space_cached)
+    disk_info: Option<(PathBuf, Option<(u64, u64)>, std::time::Instant)>,
+    disk_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Option<(u64, u64)>)>>,
     inline_rename_buf: String, // bylo kliknuto na složku? → spustit výpočet velikosti
     // Kolik znaků (od začátku) se má při otevření inline rename označit -
     // None = žádné čekající označení, Some(n) = jednorázově označit 0..n
@@ -212,6 +215,8 @@ impl Panel {
             show_hidden: false,
             inline_rename_idx: None,
             drag_out_done: false,
+            disk_info: None,
+            disk_rx: None,
             inline_rename_buf: String::new(),
             inline_rename_select_end: None,
             sort_col: SortColumn::Name,
@@ -389,6 +394,41 @@ impl Panel {
                 let name = self.entries.get(idx).map(|e| e.name.clone()).unwrap_or_default();
                 Some(NetActivation::Drill { uri: child.target_uri, name })
             }
+        }
+    }
+
+    /// Volné a celkové místo disku, na kterém panel právě je. Zjišťuje se
+    /// na pozadí (statvfs na síťovém disku může viset) a obnovuje po 10 s
+    /// nebo při změně složky - vykreslování tím nikdy nečeká.
+    fn disk_space_cached(&mut self, ctx: &egui::Context) -> Option<(u64, u64)> {
+        if let Some(rx) = &self.disk_rx {
+            match rx.try_recv() {
+                Ok((p, v)) => {
+                    self.disk_info = Some((p, v, std::time::Instant::now()));
+                    self.disk_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => { self.disk_rx = None; }
+            }
+        }
+        let stale = match &self.disk_info {
+            Some((p, _, t)) => *p != self.current_path || t.elapsed() > std::time::Duration::from_secs(10),
+            None => true,
+        };
+        if stale && self.disk_rx.is_none() && self.archive_location.is_none() && self.net_location.is_none() {
+            let path = self.current_path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let v = disk_space(&path);
+                let _ = tx.send((path, v));
+            });
+            self.disk_rx = Some(rx);
+        }
+        match &self.disk_info {
+            Some((p, v, _)) if *p == self.current_path => *v,
+            _ => None,
         }
     }
 
@@ -852,7 +892,19 @@ fn disk_space(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let bs = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
+    Some((st.f_bavail as u64 * bs, st.f_blocks as u64 * bs))
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn disk_space(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -960,6 +1012,13 @@ fn load_state() -> (Option<PathBuf>, Option<PathBuf>, Vec<Bookmark>,
         // appka ho při skoku na záložku / po startu připojí sama.
         if s.starts_with("\\\\") || p.is_dir() || parse_net_target(s).is_some() { Some(p) } else { None }
     }
+    // Záložky se ponechávají vždy, i když cesta teď neexistuje (odpojený
+    // USB disk, záloha z jiného počítače) - jinak by se při startu nebo
+    // načtení zálohy tiše a natrvalo smazaly.
+    fn bm_path(s: &str) -> Option<PathBuf> {
+        let s = s.trim();
+        if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+    }
     fn parse_sort_col(s: &str) -> Option<SortColumn> {
         match s.trim() {
             "Name" => Some(SortColumn::Name), "Ext"  => Some(SortColumn::Ext),
@@ -988,14 +1047,14 @@ fn load_state() -> (Option<PathBuf>, Option<PathBuf>, Vec<Bookmark>,
                 let _ = v; // zpracováno níže
             }
             else if let Some(v) = line.strip_prefix("BM_NAME=")  { bm_name = Some(v.trim().to_string()); }
-            else if let Some(v) = line.strip_prefix("BM_LEFT=")  { bm_left = valid_path(v); }
+            else if let Some(v) = line.strip_prefix("BM_LEFT=")  { bm_left = bm_path(v); }
             else if let Some(v) = line.strip_prefix("BM_RIGHT=") {
                 if let (Some(name), Some(bl)) = (bm_name.take(), bm_left.take()) {
-                    bookmarks.push(Bookmark { name, left: bl, right: valid_path(v) });
+                    bookmarks.push(Bookmark { name, left: bl, right: bm_path(v) });
                 }
             }
             else if let Some(v) = line.strip_prefix("BOOKMARK=") {
-                if let Some(p) = valid_path(v) {
+                if let Some(p) = bm_path(v) {
                     bookmarks.push(Bookmark {
                         name: p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                         left: p, right: None,
@@ -1006,6 +1065,101 @@ fn load_state() -> (Option<PathBuf>, Option<PathBuf>, Vec<Bookmark>,
     }
 
     (left, right, bookmarks, sort_l_col, sort_l_dir, sort_r_col, sort_r_dir, dark_mode)
+}
+
+/// Klíče, podle kterých poznáme, že soubor je záloha nastavení eR Commanderu.
+const SETTINGS_KEYS: [&str; 8] = [
+    "DARK_MODE=", "SHOW_HIDDEN=", "DIR_SORT=", "COLOR_GROUPS_SET=",
+    "BM_NAME=", "SEL_COLOR=", "EXT_EDITOR=", "RENAME_SELECT_EXT=",
+];
+
+/// Spustí externí dialog pro výběr souboru. `None` = nástroj není
+/// nainstalovaný (zkusí se další), `Some(None)` = uživatel zrušil.
+#[cfg(target_os = "linux")]
+fn run_file_dialog_tool(tool: &str, args: &[String]) -> Option<Option<PathBuf>> {
+    let out = std::process::Command::new(tool).args(args).output().ok()?;
+    if !out.status.success() {
+        return Some(None);
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(if path.is_empty() { None } else { Some(PathBuf::from(path)) })
+}
+
+/// Dialog pro uložení (`save = true`) nebo otevření zálohy nastavení.
+/// Ok(None) = uživatel výběr zrušil, Err = žádný dialog není k dispozici.
+#[allow(unreachable_code, unused_variables)]
+fn settings_file_dialog(save: bool, default_name: &str) -> Result<Option<PathBuf>, String> {
+    let home = dirs_home();
+
+    #[cfg(windows)]
+    {
+        let esc = |t: &str| t.replace('\'', "''");
+        let script = if save {
+            format!("Add-Type -AssemblyName System.Windows.Forms; \
+                     $f = New-Object System.Windows.Forms.SaveFileDialog; \
+                     $f.Filter = 'Zaloha nastaveni (*.txt)|*.txt|Vsechny soubory (*.*)|*.*'; \
+                     $f.Title = 'Ulozit nastaveni eR Commanderu'; \
+                     $f.InitialDirectory = '{}'; $f.FileName = '{}'; $f.OverwritePrompt = $true; \
+                     if ($f.ShowDialog() -eq 'OK') {{ Write-Output $f.FileName }}",
+                    esc(&home.to_string_lossy()), esc(default_name))
+        } else {
+            format!("Add-Type -AssemblyName System.Windows.Forms; \
+                     $f = New-Object System.Windows.Forms.OpenFileDialog; \
+                     $f.Filter = 'Zaloha nastaveni (*.txt)|*.txt|Vsechny soubory (*.*)|*.*'; \
+                     $f.Title = 'Nacist nastaveni eR Commanderu'; \
+                     $f.InitialDirectory = '{}'; \
+                     if ($f.ShowDialog() -eq 'OK') {{ Write-Output $f.FileName }}",
+                    esc(&home.to_string_lossy()))
+        };
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .output()
+            .map_err(|e| format!("Nepodařilo se otevřít dialog pro výběr souboru: {}", e))?;
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Ok(if path.is_empty() { None } else { Some(PathBuf::from(path)) });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let start = if save { home.join(default_name) } else { home.clone() };
+        let start = start.to_string_lossy().into_owned();
+        let title = if save { "Uložit nastavení eR Commanderu" } else { "Načíst nastavení eR Commanderu" };
+
+        let kdialog: Vec<String> = vec![
+            if save { "--getsavefilename" } else { "--getopenfilename" }.to_string(),
+            start.clone(),
+            "*.txt|Záloha nastavení (*.txt)\n*|Všechny soubory".to_string(),
+            "--title".to_string(), title.to_string(),
+        ];
+        let mut zenity: Vec<String> = vec![
+            "--file-selection".to_string(),
+            format!("--title={}", title),
+            "--file-filter=Záloha nastavení (*.txt) | *.txt".to_string(),
+            "--file-filter=Všechny soubory | *".to_string(),
+        ];
+        if save {
+            zenity.push("--save".to_string());
+            zenity.push(format!("--filename={}", start));
+        } else {
+            zenity.push(format!("--filename={}/", start));
+        }
+
+        // Na KDE dáme přednost kdialogu (zenity tam často není), jinde zenity.
+        let kde = std::env::var("XDG_CURRENT_DESKTOP").map_or(false, |d| d.to_uppercase().contains("KDE"));
+        let order: [(&str, &Vec<String>); 2] = if kde {
+            [("kdialog", &kdialog), ("zenity", &zenity)]
+        } else {
+            [("zenity", &zenity), ("kdialog", &kdialog)]
+        };
+        for (tool, args) in order {
+            if let Some(res) = run_file_dialog_tool(tool, args) {
+                return Ok(res);
+            }
+        }
+        return Err("Nepodařilo se otevřít dialog pro výběr souboru (chybí kdialog i zenity).".to_string());
+    }
+
+    Err("Dialog pro výběr souboru není na tomto systému k dispozici.".to_string())
 }
 
 // =====================================================================
@@ -1125,21 +1279,6 @@ fn spawn_hash_calc(files: Vec<PathBuf>, flag: OpFlag) -> Receiver<HashMsg> {
     rx
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            fs::copy(entry.path(), &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
 fn delete_path(path: &Path) -> std::io::Result<()> {
     if path.is_dir() {
         fs::remove_dir_all(path)
@@ -1221,6 +1360,23 @@ fn create_dst_file(dst: &Path) -> std::io::Result<fs::File> {
     fs::File::create(dst)
 }
 
+/// Jedna položka práce pro vlákna operace: jeden soubor (u kopírování a
+/// přesunu se složky předem rozloží na jednotlivé soubory, aby šlo ukázat
+/// průběh každého z nich), nebo jedna mazaná položka.
+struct OpJob {
+    src: PathBuf,
+    dst: PathBuf,
+    /// Co se ukáže v okně průběhu - u souborů ze složky relativní cesta
+    /// (např. "Fotky/2024/IMG_001.jpg").
+    label: String,
+    size: u64,
+    /// Přesun přes disky: zdrojový soubor po zkopírování smazat.
+    remove_src: bool,
+    /// Chyba zjištěná už při procházení složky (např. nečitelná podsložka) -
+    /// ve vlákně se jen nahlásí přes ErrorWait.
+    fail: Option<String>,
+}
+
 /// Spustí operaci na pozadí. Vrátí (Receiver, OpFlag) kde OpFlag
 /// slouží pro pause/resume/stop z UI vlákna.
 fn spawn_file_op(
@@ -1237,28 +1393,106 @@ fn spawn_file_op(
     let (tx, rx) = channel();
     let flag: OpFlag = Arc::new(AtomicU8::new(OP_RUN));
     let flag_thread  = flag.clone();
-    let err_flag_th  = Arc::new(err_flag);
-
-    let bytes_total: u64 = files.iter().map(|p| {
-        if p.is_file() { p.metadata().map(|m| m.len()).unwrap_or(0) } else { 0 }
-    }).sum();
 
     thread::spawn(move || {
-        let total        = files.len();
-        // Síťové složky přes GVfs (SMB/NFS v /run/user/.../gvfs): jen jedno
-        // vlákno. GVfs zapisuje přes FUSE do dočasných `.giosaveXXXXXX`
-        // souborů a se 4 souběžnými zápisy na NFS se zaseklo (ověřeno na
-        // trubka-nb: 3 soubory stály na 0 B, zůstaly prázdné .giosave*).
-        // Spojení na server je beztak jedno, paralelismus by nic nezrychlil.
-        // Totéž platí pro jakoukoliv síťovou složku (jádrové NFS/SMB z
-        // /etc/fstab, GVfs...) - spojení na server je jedno.
+        // ── 1) Plán: složky rozložit na jednotlivé soubory ────────────────
+        // Dřív se celá složka kopírovala jedním voláním copy_dir_recursive
+        // bez průběhu - okno ukázalo 100 % (velikost složky = 0 B) a pak se
+        // dlouho nic nedělo. Teď se předem vytvoří struktura složek a každý
+        // soubor jde přes stejnou smyčku s průběhem jako samostatné soubory.
+        let mut jobs: Vec<OpJob> = Vec::new();
+        let mut skipped = 0usize;
+        let mut renamed = 0usize;
+        // Zdrojové složky přesouvané přes disky - smažou se až na konci,
+        // pokud se z nich všechno přeneslo.
+        let mut move_dirs: Vec<PathBuf> = Vec::new();
+
+        for src in &files {
+            if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
+            let file_name = src.file_name()
+                .unwrap_or_default().to_string_lossy().into_owned();
+            // Cílový název - dst_name pro přejmenování, jinak původní jméno
+            let target_name = dst_name.as_deref().unwrap_or(&file_name).to_string();
+
+            if kind == OpKind::Delete {
+                jobs.push(OpJob { src: src.clone(), dst: PathBuf::new(), label: file_name,
+                                  size: 0, remove_src: false, fail: None });
+                continue;
+            }
+
+            let dst = dst_dir.as_ref().unwrap().join(&target_name);
+            if !overwrite && dst.exists() {
+                skipped += 1;
+                continue;
+            }
+            // Přesun na stejném disku = okamžitý rename (i celé složky).
+            if kind == OpKind::Move && fs::rename(src, &dst).is_ok() {
+                renamed += 1;
+                continue;
+            }
+
+            if src.is_dir() {
+                let _ = tx.send(OpMsg::SlotStart {
+                    thread_id: 0,
+                    file: format!("Zjišťuji obsah složky {}...", file_name),
+                    file_size: 0,
+                });
+                for entry in WalkDir::new(src).follow_links(false).sort_by_file_name() {
+                    if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => {
+                            let p = e.path().map(Path::to_path_buf).unwrap_or_else(|| src.clone());
+                            let rel = p.strip_prefix(src).unwrap_or(&p).to_path_buf();
+                            jobs.push(OpJob {
+                                src: p, dst: PathBuf::new(),
+                                label: Path::new(&target_name).join(rel).display().to_string(),
+                                size: 0, remove_src: false, fail: Some(e.to_string()),
+                            });
+                            continue;
+                        }
+                    };
+                    let rel = entry.path().strip_prefix(src).unwrap_or(entry.path()).to_path_buf();
+                    let d = dst.join(&rel);
+                    let label = Path::new(&target_name).join(&rel).display().to_string();
+                    if entry.file_type().is_dir() {
+                        // Strukturu složek (i prázdné složky) vytvoříme hned.
+                        if let Err(e) = fs::create_dir_all(&d) {
+                            jobs.push(OpJob { src: entry.path().to_path_buf(), dst: d, label,
+                                              size: 0, remove_src: false, fail: Some(e.to_string()) });
+                        }
+                    } else if entry.path().is_file() {
+                        let size = fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
+                        jobs.push(OpJob { src: entry.path().to_path_buf(), dst: d, label, size,
+                                          remove_src: kind == OpKind::Move, fail: None });
+                    }
+                }
+                let _ = tx.send(OpMsg::SlotDone { thread_id: 0 });
+                if kind == OpKind::Move { move_dirs.push(src.clone()); }
+            } else {
+                let size = src.metadata().map(|m| m.len()).unwrap_or(0);
+                jobs.push(OpJob { src: src.clone(), dst, label: target_name, size,
+                                  remove_src: kind == OpKind::Move, fail: None });
+            }
+        }
+
+        let total       = jobs.len() + skipped + renamed;
+        let bytes_total: u64 = jobs.iter().map(|j| j.size).sum();
+        let _ = tx.send(OpMsg::Progress { done: renamed, total, bytes_done: 0, bytes_total });
+        for _ in 0..skipped { let _ = tx.send(OpMsg::Skipped(())); }
+
+        // ── 2) Provedení ──────────────────────────────────────────────────
+        // Síťové složky (GVfs i jádrové NFS/SMB): jen jedno vlákno. GVfs
+        // zapisuje přes FUSE do dočasných `.giosaveXXXXXX` a se 4 souběžnými
+        // zápisy na NFS se zaseklo (ověřeno na trubka-nb); spojení na server
+        // je beztak jedno, paralelismus by nic nezrychlil.
         let network = dst_dir.as_deref().map_or(false, is_network_path)
             || files.iter().any(|f| is_network_path(f));
-        let num_threads  = if network { 1 } else { 4.min(total).max(1) };
-        let done_counter = Arc::new(AtomicUsize::new(0));
+        let num_threads  = if network { 1 } else { 4.min(jobs.len()).max(1) };
+        let done_counter = Arc::new(AtomicUsize::new(renamed + skipped));
         let bytes_global = Arc::new(AtomicU64::new(0));
+        let failed       = Arc::new(AtomicUsize::new(0));
         let tx           = Arc::new(std::sync::Mutex::new(tx));
-        let err_flag_th  = Arc::new(err_flag_th);
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
@@ -1266,14 +1500,9 @@ fn spawn_file_op(
             .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
 
         pool.install(|| {
-            files.par_iter().enumerate().for_each(|(par_idx, src)| {
-                // Slot v progress dialogu = index rayon workeru, který soubor
-                // právě zpracovává (0..num_threads). Každý worker kopíruje
-                // v jednu chvíli jen jeden soubor, takže se sloty nikdy
-                // nepřekrývají. (Dřív tu bylo `par_idx % num_threads`, jenže
-                // rayon nerozděluje soubory po řadě - dva současně kopírované
-                // soubory pak sdílely jeden slot: jejich bajty se sčítaly
-                // (např. "694 MB / 579 MB") a jeden progress bar chyběl.)
+            jobs.par_iter().enumerate().for_each(|(par_idx, job)| {
+                // Slot v okně průběhu = index rayon workeru (každý worker
+                // zpracovává v jednu chvíli jen jeden soubor).
                 let thread_id = rayon::current_thread_index().unwrap_or(par_idx) % num_threads;
 
                 if flag_thread.load(Ordering::Relaxed) == OP_STOP { return; }
@@ -1282,149 +1511,72 @@ fn spawn_file_op(
                 }
                 if flag_thread.load(Ordering::Relaxed) == OP_STOP { return; }
 
-                let file_name = src.file_name()
-                    .unwrap_or_default().to_string_lossy().into_owned();
-                // Cílový název - dst_name pro přejmenování, jinak původní jméno
-                let target_name = dst_name.as_deref().unwrap_or(&file_name).to_string();
-                let file_size = if src.is_file() {
-                    src.metadata().map(|m| m.len()).unwrap_or(0)
-                } else { 0 };
-
-                if kind != OpKind::Delete {
-                    let dst = dst_dir.as_ref().unwrap().join(&target_name);
-                    if !overwrite && dst.exists() {
-                        if let Ok(t) = tx.lock() { let _ = t.send(OpMsg::Skipped(())); }
-                        return;
-                    }
-                }
-
-                // Oznámíme start slotu
                 if let Ok(t) = tx.lock() {
                     let _ = t.send(OpMsg::SlotStart {
                         thread_id,
-                        file: target_name.clone(),
-                        file_size,
+                        file: job.label.clone(),
+                        file_size: job.size,
                     });
                 }
 
-                let result: std::io::Result<()> = match kind {
-                    OpKind::Copy => {
-                        let dst = dst_dir.as_ref().unwrap().join(&target_name);
-                        if src.is_dir() {
-                            copy_dir_recursive(src, &dst)
-                        } else {
-                            // Vlastní copy loop v IIFE closure (vrací Result, ? funguje)
-                            (|| -> std::io::Result<()> {
-                                use std::io::{Read, Write};
-                                let mut src_file = fs::File::open(src)?;
-                                let mut dst_file = create_dst_file(&dst)?;
-                                let mut buf = vec![0u8; 256 * 1024];
-                                let (mut written, mut synced) = (0u64, 0u64);
-                                loop {
-                                    if flag_thread.load(Ordering::Relaxed) == OP_STOP {
-                                        break;
-                                    }
-                                    while flag_thread.load(Ordering::Relaxed) == OP_PAUSE {
-                                        thread::sleep(std::time::Duration::from_millis(50));
-                                    }
-                                    let n = src_file.read(&mut buf)?;
-                                    if n == 0 { break; }
-                                    dst_file.write_all(&buf[..n])?;
-                                    written += n as u64;
-                                    if network && written - synced >= NET_FLUSH_CHUNK {
-                                        flush_written(&dst_file, synced, written - synced);
-                                        synced = written;
-                                    }
-                                    let bytes = bytes_global.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-                                    if let Ok(t) = tx.lock() {
-                                        let _ = t.send(OpMsg::SlotProgress {
-                                            thread_id,
-                                            bytes_copied: n as u64,
-                                        });
-                                        let done = done_counter.load(Ordering::Relaxed);
-                                        let _ = t.send(OpMsg::Progress {
-                                            done,
-                                            total,
-                                            bytes_done: bytes,
-                                            bytes_total,
-                                        });
-                                    }
-                                }
-                                Ok(())
-                            })()
+                let copy_file = || -> std::io::Result<()> {
+                    use std::io::{Read, Write};
+                    let mut src_file = fs::File::open(&job.src)?;
+                    let mut dst_file = create_dst_file(&job.dst)?;
+                    let mut buf = vec![0u8; 256 * 1024];
+                    let (mut written, mut synced) = (0u64, 0u64);
+                    loop {
+                        if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
+                        while flag_thread.load(Ordering::Relaxed) == OP_PAUSE {
+                            thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        let n = src_file.read(&mut buf)?;
+                        if n == 0 { break; }
+                        dst_file.write_all(&buf[..n])?;
+                        written += n as u64;
+                        if network && written - synced >= NET_FLUSH_CHUNK {
+                            flush_written(&dst_file, synced, written - synced);
+                            synced = written;
+                        }
+                        let bytes = bytes_global.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                        if let Ok(t) = tx.lock() {
+                            let _ = t.send(OpMsg::SlotProgress { thread_id, bytes_copied: n as u64 });
+                            let done = done_counter.load(Ordering::Relaxed);
+                            let _ = t.send(OpMsg::Progress { done, total, bytes_done: bytes, bytes_total });
                         }
                     }
-                    OpKind::Move => {
-                        let dst = dst_dir.as_ref().unwrap().join(&target_name);
-                        // Zkusíme nejdřív rychlý rename (stejný disk)
-                        match fs::rename(src, &dst) {
-                            Ok(()) => {
-                                // Rename je okamžitý - aktualizujeme bytes pro progress
-                                let bytes = bytes_global.fetch_add(file_size, Ordering::Relaxed) + file_size;
-                                if let Ok(t) = tx.lock() {
-                                    let _ = t.send(OpMsg::Progress {
-                                        done: done_counter.load(Ordering::Relaxed),
-                                        total,
-                                        bytes_done: bytes,
-                                        bytes_total,
-                                    });
-                                }
-                                Ok(())
-                            },
-                            Err(_) => {
-                                // Mezidiskový přesun - IIFE aby ? fungovalo v for_each closure
-                                (|| -> std::io::Result<()> {
-                                    if src.is_dir() {
-                                        copy_dir_recursive(src, &dst)?;
-                                        fs::remove_dir_all(src)?;
-                                    } else {
-                                        use std::io::{Read, Write};
-                                        let mut src_file = fs::File::open(src)?;
-                                        let mut dst_file = create_dst_file(&dst)?;
-                                        let mut buf = vec![0u8; 256 * 1024];
-                                        let (mut written, mut synced) = (0u64, 0u64);
-                                        loop {
-                                            if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
-                                            while flag_thread.load(Ordering::Relaxed) == OP_PAUSE {
-                                                thread::sleep(std::time::Duration::from_millis(50));
-                                            }
-                                            let n = src_file.read(&mut buf)?;
-                                            if n == 0 { break; }
-                                            dst_file.write_all(&buf[..n])?;
-                                            written += n as u64;
-                                            if network && written - synced >= NET_FLUSH_CHUNK {
-                                                flush_written(&dst_file, synced, written - synced);
-                                                synced = written;
-                                            }
-                                            let bytes = bytes_global.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-                                            if let Ok(t) = tx.lock() {
-                                                let _ = t.send(OpMsg::SlotProgress { thread_id, bytes_copied: n as u64 });
-                                                let done = done_counter.load(Ordering::Relaxed);
-                                                let _ = t.send(OpMsg::Progress { done, total, bytes_done: bytes, bytes_total });
-                                            }
-                                        }
-                                        fs::remove_file(src)?;
-                                    }
-                                    Ok(())
-                                })()
-                            }
-                        }
+                    Ok(())
+                };
+
+                let result: std::io::Result<()> = if let Some(msg) = &job.fail {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, msg.clone()))
+                } else {
+                    match kind {
+                        OpKind::Copy => copy_file(),
+                        OpKind::Move => copy_file().and_then(|_| {
+                            // Zdroj smazat jen po úplném zkopírování (ne po Zastavit).
+                            if job.remove_src && flag_thread.load(Ordering::Relaxed) != OP_STOP {
+                                fs::remove_file(&job.src)
+                            } else { Ok(()) }
+                        }),
+                        OpKind::Delete => delete_path(&job.src),
                     }
-                    OpKind::Delete => delete_path(src),
                 };
 
                 if let Err(e) = result {
+                    failed.fetch_add(1, Ordering::Relaxed);
                     // Pošleme ErrorWait a čekáme na odpověď
-                    err_flag_th.store(ERR_WAIT, Ordering::Relaxed);
+                    err_flag.store(ERR_WAIT, Ordering::Relaxed);
                     if let Ok(t) = tx.lock() {
+                        let _ = t.send(OpMsg::SlotDone { thread_id });
                         let _ = t.send(OpMsg::ErrorWait {
-                            file: file_name.clone(),
+                            file: job.label.clone(),
                             error: e.to_string(),
                         });
                     }
                     loop {
                         thread::sleep(std::time::Duration::from_millis(50));
-                        match err_flag_th.load(Ordering::Relaxed) {
+                        match err_flag.load(Ordering::Relaxed) {
                             ERR_RETRY  => break, // pokračujeme (přeskočíme)
                             ERR_SKIP   => { return; }
                             ERR_CANCEL => {
@@ -1447,7 +1599,16 @@ fn spawn_file_op(
             });
         });
 
-        if flag_thread.load(Ordering::Relaxed) == OP_STOP {
+        let stopped = flag_thread.load(Ordering::Relaxed) == OP_STOP;
+        // Přesun složky přes disky: zdrojovou složku (už jen prázdné
+        // podsložky) smazat, jen když se všechno přeneslo bez chyby.
+        if kind == OpKind::Move && !stopped && failed.load(Ordering::Relaxed) == 0 {
+            for d in &move_dirs {
+                let _ = fs::remove_dir_all(d);
+            }
+        }
+
+        if stopped {
             if let Ok(t) = tx.lock() {
                 let _ = t.send(OpMsg::Error("Operace zastavena uživatelem.".to_string()));
             }
@@ -2653,10 +2814,21 @@ fn gio_mount_worker(
 
     match resolve_gvfs_mount_path(protocol, &server, &share) {
         Some(path) => Ok(path),
-        None => Err(format!(
-            "Připojení proběhlo, ale nepodařilo se najít lokální cestu k mount bodu.\n\nPřipojená síťová umístění (gio mount -l):\n{}",
-            if listing.is_empty() { "(žádná)".to_string() } else { listing }
-        )),
+        None => {
+            // Na Debianu/Ubuntu/Kubuntu je FUSE vrstva GVfs (která vytváří
+            // /run/user/UID/gvfs) v samostatném balíčku gvfs-fuse - bez něj
+            // `gio mount` projde, ale lokální cesta nevznikne.
+            let fuse_missing = gvfs_runtime_dir().map_or(true, |d| !d.is_dir());
+            let hint = if fuse_missing {
+                "\n\nChybí adresář GVfs FUSE (/run/user/UID/gvfs). Nainstaluj balíček gvfs-fuse: \
+                 `sudo apt install gvfs-fuse` (Kubuntu/Ubuntu/Debian), pak se odhlas a znovu přihlas (nebo spusť `/usr/libexec/gvfsd-fuse /run/user/$(id -u)/gvfs`)."
+            } else { "" };
+            Err(format!(
+                "Připojení proběhlo, ale nepodařilo se najít lokální cestu k mount bodu.{}\n\nPřipojená síťová umístění (gio mount -l):\n{}",
+                hint,
+                if listing.is_empty() { "(žádná)".to_string() } else { listing }
+            ))
+        }
     }
 }
 
@@ -3374,7 +3546,9 @@ impl FileManagerApp {
 
     /// Centralizovaný start operace - nastaví všechna progress pole a otevře dialog.
     fn start_op(&mut self, label: &str, rx: Receiver<OpMsg>, flag: OpFlag, total: usize) {
-        let threads = 4.min(total).max(1);
+        // Vždy 4 sloty: složky se ve vlákně rozloží na soubory, takže
+        // souběžně může běžet víc souborů, než kolik položek bylo vybráno.
+        let threads = 4;
         self.op_rx          = Some(rx);
         self.op_flag        = Some(flag);
         self.op_kind_label  = label.to_string();
@@ -3871,6 +4045,124 @@ impl FileManagerApp {
         let _ = fs::write(state_file_path(), content);
     }
 
+    /// Znovu načte nastavení ze stavového souboru do běžící appky (po
+    /// importu zálohy). Složky, ve kterých panely právě jsou, se nemění.
+    fn reload_settings_from_state(&mut self) {
+        let (_, _, bookmarks, sort_l_col, sort_l_dir, sort_r_col, sort_r_dir, dark_mode) = load_state();
+        let content = fs::read_to_string(state_file_path()).unwrap_or_default();
+        let get = |key: &str| content.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().to_string());
+
+        self.bookmarks = bookmarks;
+        self.bm_edit_idx = None;
+        self.bm_sel = 0;
+        self.dark_mode = dark_mode;
+        self.show_hidden = get("SHOW_HIDDEN=").map_or(false, |v| v == "true");
+        self.external_editor = get("EXT_EDITOR=").unwrap_or_default();
+        self.rename_select_ext = get("RENAME_SELECT_EXT=").map_or(false, |v| v == "true");
+        self.dir_sort = match get("DIR_SORT=").as_deref() {
+            Some("FirstByName") => DirSort::FirstByName,
+            Some("Mixed")       => DirSort::Mixed,
+            _                   => DirSort::FirstByCol,
+        };
+        self.sel_color = get("SEL_COLOR=")
+            .map(|h| h.trim_start_matches('#').to_string())
+            .and_then(|h| if h.len() == 6 { u32::from_str_radix(&h, 16).ok() } else { None })
+            .map(|n| [(n >> 16) as u8, (n >> 8) as u8, n as u8])
+            .unwrap_or(DEFAULT_SEL_COLOR);
+        self.color_groups = load_color_groups();
+        self.ext_colors = build_ext_colors(&self.color_groups);
+
+        let (dir_sort, show_hidden) = (self.dir_sort, self.show_hidden);
+        for (panel, col, dir) in [(&mut self.left, sort_l_col, sort_l_dir),
+                                  (&mut self.right, sort_r_col, sort_r_dir)] {
+            if let Some(c) = col { panel.sort_col = c; }
+            if let Some(d) = dir { panel.sort_dir = d; }
+            panel.dir_sort = dir_sort;
+            panel.show_hidden = show_hidden;
+            panel.refresh();
+        }
+    }
+
+    /// Nastavení → Záloha nastavení → Uložit do souboru.
+    fn export_settings(&mut self) {
+        self.save_state();
+        let default_name = format!("er_commander_nastaveni_{}.txt", Local::now().format("%Y-%m-%d"));
+        let mut path = match settings_file_dialog(true, &default_name) {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => { self.op_status = Some(StatusMsg::Error(e)); return; }
+        };
+        if path.extension().is_none() {
+            path.set_extension("txt");
+        }
+        let body = fs::read_to_string(state_file_path()).unwrap_or_default();
+        let content = format!(
+            "# eR Commander - záloha nastavení\n# verze {}, uloženo {}\n# Načtení: Nastavení → Záloha nastavení → Načíst ze souboru\n{}",
+            env!("CARGO_PKG_VERSION"), Local::now().format("%d.%m.%Y %H:%M"), body);
+        self.op_status = Some(match fs::write(&path, content) {
+            Ok(_)  => StatusMsg::Info(format!("Nastavení uloženo do {}", path.display())),
+            Err(e) => StatusMsg::Error(format!("Nastavení se nepodařilo uložit do {}: {}", path.display(), e)),
+        });
+    }
+
+    /// Nastavení → Záloha nastavení → Načíst ze souboru. Současné nastavení
+    /// se nejdřív zazáloží do ~/.er_commander_state.txt.bak.
+    fn import_settings(&mut self) {
+        let path = match settings_file_dialog(false, "") {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => { self.op_status = Some(StatusMsg::Error(e)); return; }
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.op_status = Some(StatusMsg::Error(format!("Soubor {} nejde přečíst: {}", path.display(), e)));
+                return;
+            }
+        };
+        if !content.lines().any(|l| SETTINGS_KEYS.iter().any(|k| l.starts_with(k))) {
+            self.op_status = Some(StatusMsg::Error(format!(
+                "Soubor {} není záloha nastavení eR Commanderu.", path.display())));
+            return;
+        }
+
+        // Aktuální stav zazálohovat, ať jde import vrátit.
+        self.save_state();
+        let state = state_file_path();
+        let backup = dirs_home().join(".er_commander_state.txt.bak");
+        let _ = fs::copy(&state, &backup);
+
+        // Složky panelů (LEFT/RIGHT) ze zálohy nepřebíráme - panely zůstanou,
+        // kde jsou. Komentáře (#) zahodíme.
+        let filtered: String = content.lines()
+            .filter(|l| !l.starts_with("LEFT=") && !l.starts_with("RIGHT=") && !l.starts_with('#'))
+            .map(|l| format!("{}\n", l))
+            .collect();
+        if let Err(e) = fs::write(&state, filtered) {
+            self.op_status = Some(StatusMsg::Error(format!("Nastavení se nepodařilo zapsat: {}", e)));
+            return;
+        }
+
+        self.reload_settings_from_state();
+        self.save_state(); // zpět doplní aktuální LEFT/RIGHT
+
+        let exists = |p: &Path| p.is_dir()
+            || p.to_string_lossy().starts_with("\\\\")
+            || parse_net_target(&p.to_string_lossy()).is_some();
+        let missing = self.bookmarks.iter()
+            .filter(|b| !exists(&b.left) || b.right.as_deref().map_or(false, |r| !exists(r)))
+            .count();
+        let msg = format!("Nastavení načteno z {} - záložek: {} (předchozí nastavení uloženo do {}).",
+            path.display(), self.bookmarks.len(), backup.display());
+        self.op_status = Some(if missing > 0 {
+            StatusMsg::Warn(format!("{} Záložek s cestou, která tu teď neexistuje: {} - zůstaly zachované, uprav je v Záložkách.", msg, missing))
+        } else {
+            StatusMsg::Info(msg)
+        });
+    }
+
     fn save_window_state(&self, ctx: &egui::Context) {
         let info = ctx.input(|i| i.viewport().clone());
         let maximized  = info.maximized.unwrap_or(false);
@@ -4035,6 +4327,13 @@ impl FileManagerApp {
                 self.start_target_mount(which, t, focus);
                 return;
             }
+        }
+        let is_unc = path.to_string_lossy().starts_with("\\\\");
+        if !path.is_dir() && !is_unc {
+            self.op_status = Some(StatusMsg::Warn(format!(
+                "Složka {} neexistuje (odpojený disk, nebo záložka z jiného počítače?)",
+                path.display())));
+            return;
         }
         let panel = match which {
             ActivePanel::Left  => &mut self.left,
@@ -5896,6 +6195,8 @@ impl FileManagerApp {
         }
         let mut changed = false;
         let mut colors_changed = false;
+        let mut do_export = false;
+        let mut do_import = false;
         // Výchozí velikost a poloha (střed obrazovky). Bez pivotu/kotvy, aby se
         // okno při tažení za roh neposouvalo.
         let settings_size = egui::vec2(720.0, (ctx.screen_rect().height() - 120.0).clamp(300.0, 720.0));
@@ -6128,6 +6429,23 @@ impl FileManagerApp {
                 });
 
                 ui.add_space(8.0);
+
+                // Záloha nastavení do souboru / obnovení ze souboru
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Záloha nastavení").strong());
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Uložit do souboru...").clicked() { do_export = true; }
+                        if ui.button("📂 Načíst ze souboru...").clicked() { do_import = true; }
+                    });
+                    ui.label(egui::RichText::new(
+                        "Uloží vzhled, řazení, barvy, externí editor a záložky do textového souboru. \
+                         Při načtení se současné nastavení nejdřív zazálohuje do ~/.er_commander_state.txt.bak. \
+                         Hesla k síťovým složkám v záloze nejsou.")
+                        .small().color(egui::Color32::GRAY));
+                });
+
+                ui.add_space(8.0);
                 ui.separator();
                 if ui.button("Zavřít").clicked() {
                     self.show_settings = false;
@@ -6140,6 +6458,8 @@ impl FileManagerApp {
             changed = true;
         }
         if changed { self.save_state(); }
+        if do_export { self.export_settings(); }
+        if do_import { self.import_settings(); }
     }
 
     fn render_about_dialog(&mut self, ctx: &egui::Context) {
@@ -7780,7 +8100,7 @@ fn render_panel(
                 });
             let star_w = 28.0;
             let bar_w  = (ui.available_width() - star_w).max(20.0);
-            if let Some((free, total)) = disk_space(&panel.current_path) {
+            if let Some((free, total)) = panel.disk_space_cached(ui.ctx()) {
                 if total > 0 {
                     let used = total - free;
                     let frac = used as f64 / total as f64;
@@ -8490,9 +8810,14 @@ fn ensure_linux_desktop_entry() {
         return;
     }
 
+    // Ikonu zapisujeme jen když chybí nebo se liší - zbytečný zápis při
+    // každém startu by KDE nutil přestavovat cache ikon/aplikací.
     let icon_path = icon_dir.join("er-commander.png");
-    if let Ok(mut f) = File::create(&icon_path) {
-        let _ = f.write_all(include_bytes!("../assets/app_icon.png"));
+    let icon_bytes: &[u8] = include_bytes!("../assets/app_icon.png");
+    if fs::read(&icon_path).map_or(true, |b| b != icon_bytes) {
+        if let Ok(mut f) = File::create(&icon_path) {
+            let _ = f.write_all(icon_bytes);
+        }
     }
 
     // Název .desktop souboru MUSÍ přesně (case-sensitive) odpovídat
@@ -8503,12 +8828,21 @@ fn ensure_linux_desktop_entry() {
     // StartupWMClass je jen X11/GTK fallback, který na Waylandu pro
     // dekoraci okna nestačí (proto fungovala ikonka v panelu úloh,
     // ale ne v titulku okna).
+    //
+    // Icon= je ABSOLUTNÍ cesta k PNG: KDE (Kubuntu 26.04) ikonu podle
+    // samotného jména "er-commander" v ~/.local/share/icons/hicolor
+    // nenašlo (menu i okno ukazovaly obecnou ikonu), s plnou cestou ano.
     let desktop_path = apps_dir.join("eR_Commander.desktop");
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=eR Commander\nComment=Dvoupanelový správce souborů\nExec=\"{}\"\nIcon=er-commander\nCategories=Utility;FileManager;System;\nTerminal=false\nStartupNotify=true\nStartupWMClass=eR_Commander\n",
-        exe_path.display()
+        "[Desktop Entry]\nType=Application\nName=eR Commander\nComment=Dvoupanelový správce souborů\nExec=\"{}\"\nIcon={}\nCategories=Utility;FileManager;System;\nTerminal=false\nStartupNotify=true\nStartupWMClass=eR_Commander\n",
+        exe_path.display(),
+        icon_path.display()
     );
-    if fs::write(&desktop_path, content).is_err() {
+    // Zapisovat jen při změně - jinak by se KDE cache aplikací (sycoca)
+    // přestavovala při každém startu a KWin by mezitím nemusel okno
+    // spárovat s .desktop záznamem (= obecná ikona v titulku/liště).
+    let changed = fs::read_to_string(&desktop_path).map_or(true, |old| old != content);
+    if changed && fs::write(&desktop_path, &content).is_err() {
         return;
     }
 
@@ -8530,11 +8864,27 @@ fn ensure_linux_desktop_entry() {
         }
     }
 
+    if !changed {
+        return;
+    }
+
     // Ať se menu (GNOME/KDE/XFCE...) obnoví hned, pokud nástroj existuje.
     // Když chybí, jednoduše se přeskočí - většina prostředí si všimne i tak.
+    // KDE má vlastní cache (sycoca), kterou update-desktop-database
+    // neobnoví - proto ještě kbuildsycoca6 (Plasma 6) / kbuildsycoca5.
     let _ = std::process::Command::new("update-desktop-database")
         .arg(&apps_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
+    for tool in ["kbuildsycoca6", "kbuildsycoca5"] {
+        let ok = std::process::Command::new(tool)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(false, |st| st.success());
+        if ok { break; }
+    }
 }
 
 fn main() -> eframe::Result<()> {
