@@ -1193,7 +1193,14 @@ enum OpMsg {
         thread_id: usize,
         bytes_copied: u64,
     },
+    /// Soubor ve slotu dokončen - zůstane v okně vidět (100 %), dokud ho
+    /// nenahradí další soubor. Jinak by se u malých souborů slot stihl
+    /// objevit i zmizet mezi dvěma snímky a pruh by nebyl vidět vůbec.
     SlotDone {
+        thread_id: usize,
+    },
+    /// Slot vyprázdnit (konec procházení složky, chyba).
+    SlotClear {
         thread_id: usize,
     },
     /// Celkový progress (done/total souborů, bytes celkem)
@@ -1467,7 +1474,7 @@ fn spawn_file_op(
                                           remove_src: kind == OpKind::Move, fail: None });
                     }
                 }
-                let _ = tx.send(OpMsg::SlotDone { thread_id: 0 });
+                let _ = tx.send(OpMsg::SlotClear { thread_id: 0 });
                 if kind == OpKind::Move { move_dirs.push(src.clone()); }
             } else {
                 let size = src.metadata().map(|m| m.len()).unwrap_or(0);
@@ -1568,7 +1575,7 @@ fn spawn_file_op(
                     // Pošleme ErrorWait a čekáme na odpověď
                     err_flag.store(ERR_WAIT, Ordering::Relaxed);
                     if let Ok(t) = tx.lock() {
-                        let _ = t.send(OpMsg::SlotDone { thread_id });
+                        let _ = t.send(OpMsg::SlotClear { thread_id });
                         let _ = t.send(OpMsg::ErrorWait {
                             file: job.label.clone(),
                             error: e.to_string(),
@@ -4384,6 +4391,11 @@ impl FileManagerApp {
                     }
                 }
                 OpMsg::SlotDone { thread_id } => {
+                    if let Some(Some(slot)) = self.op_slots.get_mut(thread_id) {
+                        slot.copied = slot.size;
+                    }
+                }
+                OpMsg::SlotClear { thread_id } => {
                     if let Some(slot) = self.op_slots.get_mut(thread_id) {
                         *slot = None;
                     }
@@ -8914,6 +8926,12 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
+        // Linux/Wayland: s vsync čeká eglSwapBuffers na snímek od
+        // kompozitoru, a ten okno minimalizované / na jiné ploše / zakryté
+        // nedostane - egui pak nezpracuje požadavek na zavření a KDE při
+        // vypnutí PC hlásí, že eR Commander pořád běží. egui překresluje
+        // jen při změně, takže bez vsync se zátěž nezvýší.
+        vsync: !cfg!(target_os = "linux"),
         ..Default::default()
     };
 
