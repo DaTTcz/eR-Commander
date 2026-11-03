@@ -1428,12 +1428,16 @@ fn spawn_file_op(
             }
 
             let dst = dst_dir.as_ref().unwrap().join(&target_name);
-            if !overwrite && dst.exists() {
+            // Existující složka v cíli se slučuje: "přeskočit existující"
+            // pak platí pro jednotlivé soubory uvnitř, ne pro celou složku.
+            let merge_dir = src.is_dir() && dst.is_dir();
+            if !overwrite && dst.exists() && !merge_dir {
                 skipped += 1;
                 continue;
             }
-            // Přesun na stejném disku = okamžitý rename (i celé složky).
-            if kind == OpKind::Move && fs::rename(src, &dst).is_ok() {
+            // Přesun na stejném disku = okamžitý rename (i celé složky,
+            // pokud v cíli ještě není).
+            if kind == OpKind::Move && !merge_dir && fs::rename(src, &dst).is_ok() {
                 renamed += 1;
                 continue;
             }
@@ -1469,6 +1473,10 @@ fn spawn_file_op(
                                               size: 0, remove_src: false, fail: Some(e.to_string()) });
                         }
                     } else if entry.path().is_file() {
+                        if !overwrite && d.exists() {
+                            skipped += 1;
+                            continue;
+                        }
                         let size = fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
                         jobs.push(OpJob { src: entry.path().to_path_buf(), dst: d, label, size,
                                           remove_src: kind == OpKind::Move, fail: None });
@@ -1560,6 +1568,16 @@ fn spawn_file_op(
                 } else {
                     match kind {
                         OpKind::Copy => copy_file(),
+                        // Stejný disk: rename souboru je okamžitý (i u slučování složek).
+                        OpKind::Move if fs::rename(&job.src, &job.dst).is_ok() => {
+                            let bytes = bytes_global.fetch_add(job.size, Ordering::Relaxed) + job.size;
+                            if let Ok(t) = tx.lock() {
+                                let _ = t.send(OpMsg::SlotProgress { thread_id, bytes_copied: job.size });
+                                let done = done_counter.load(Ordering::Relaxed);
+                                let _ = t.send(OpMsg::Progress { done, total, bytes_done: bytes, bytes_total });
+                            }
+                            Ok(())
+                        }
                         OpKind::Move => copy_file().and_then(|_| {
                             // Zdroj smazat jen po úplném zkopírování (ne po Zastavit).
                             if job.remove_src && flag_thread.load(Ordering::Relaxed) != OP_STOP {
@@ -1607,11 +1625,17 @@ fn spawn_file_op(
         });
 
         let stopped = flag_thread.load(Ordering::Relaxed) == OP_STOP;
-        // Přesun složky přes disky: zdrojovou složku (už jen prázdné
-        // podsložky) smazat, jen když se všechno přeneslo bez chyby.
-        if kind == OpKind::Move && !stopped && failed.load(Ordering::Relaxed) == 0 {
+        // Přesun složky: ve zdroji smazat jen složky, které po přesunu
+        // zůstaly PRÁZDNÉ (od nejhlubší). Přeskočené nebo chybové soubory
+        // tak ve zdroji zůstanou i se svými složkami.
+        if kind == OpKind::Move && !stopped {
+            let _ = failed.load(Ordering::Relaxed);
             for d in &move_dirs {
-                let _ = fs::remove_dir_all(d);
+                for entry in WalkDir::new(d).contents_first(true).into_iter().flatten() {
+                    if entry.file_type().is_dir() {
+                        let _ = fs::remove_dir(entry.path());
+                    }
+                }
             }
         }
 
@@ -1875,18 +1899,40 @@ fn open_with_system_app(path: &Path) -> std::io::Result<()> {
 
 /// Vrátí jména těch souborů/adresářů, které by v cílovém adresáři přepsaly
 /// už existující položku (kontrola PŘED spuštěním operace na pozadí).
-fn paths_conflicting(files: &[PathBuf], dst_dir: &Path) -> Vec<String> {
-    files
-        .iter()
-        .filter_map(|src| {
-            let name = src.file_name()?.to_string_lossy().into_owned();
-            if dst_dir.join(&name).exists() {
-                Some(name)
-            } else {
-                None
+/// Které soubory by kopírování/přesun v cíli přepsalo. Složka, která v cíli
+/// už existuje, se SLUČUJE - konfliktem jsou jen soubory uvnitř, které tam
+/// už jsou (vypíší se s relativní cestou, např. "Fotky/IMG_001.jpg").
+/// Procházení je omezené, aby obří strom nezablokoval UI - po limitu se
+/// složka nahlásí celá.
+fn paths_conflicting(files: &[PathBuf], dst_dir: &Path, dst_name: Option<&str>) -> Vec<String> {
+    const MAX_LIST: usize = 500;
+    const MAX_SCAN: usize = 20_000;
+    let mut out = Vec::new();
+    for src in files {
+        let Some(orig) = src.file_name() else { continue };
+        let name = dst_name.map(str::to_string)
+            .unwrap_or_else(|| orig.to_string_lossy().into_owned());
+        let dst = dst_dir.join(&name);
+        if !dst.exists() { continue; }
+        if !(src.is_dir() && dst.is_dir()) {
+            out.push(name);
+            continue;
+        }
+        let mut scanned = 0usize;
+        for entry in WalkDir::new(src).min_depth(1).follow_links(false).into_iter().flatten() {
+            scanned += 1;
+            if scanned > MAX_SCAN || out.len() >= MAX_LIST {
+                out.push(format!("{}/ (a další soubory ve složce)", name));
+                break;
             }
-        })
-        .collect()
+            if entry.file_type().is_dir() { continue; }
+            let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
+            if dst.join(rel).exists() {
+                out.push(Path::new(&name).join(rel).display().to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Totéž, ale pro položky vybrané uvnitř ZIP archivu (porovnává jen podle jména).
@@ -1989,7 +2035,7 @@ fn format_size(bytes: u64) -> String {
 
 /// Operace čekající na rozhodnutí uživatele (přepsat / přeskočit existující).
 enum PendingAction {
-    FsOp { kind: OpKind, files: Vec<PathBuf>, dst: PathBuf },
+    FsOp { kind: OpKind, files: Vec<PathBuf>, dst: PathBuf, dst_name: Option<String> },
     ZipExtract {
         archive_path: PathBuf,
         internal_dir: String,
@@ -3646,7 +3692,7 @@ impl FileManagerApp {
             if new_name != orig { Some(new_name) } else { None }
         } else { None };
 
-        let conflicts = paths_conflicting(&files, &dst);
+        let conflicts = paths_conflicting(&files, &dst, dst_name.as_deref());
         if conflicts.is_empty() {
             let label = if kind == OpKind::Copy { "Kopírování" } else { "Přesun" };
             let n = files.len();
@@ -3654,7 +3700,7 @@ impl FileManagerApp {
             self.start_op(label, rx, flag, n);
         } else {
             self.pending_conflicts = conflicts;
-            self.pending_action = Some(PendingAction::FsOp { kind, files, dst });
+            self.pending_action = Some(PendingAction::FsOp { kind, files, dst, dst_name });
             self.overwrite_focus = 0;
         }
     }
@@ -3663,14 +3709,14 @@ impl FileManagerApp {
         let Some(action) = self.pending_action.take() else { return; };
         self.pending_conflicts.clear();
         match action {
-            PendingAction::FsOp { kind, files, dst } => {
+            PendingAction::FsOp { kind, files, dst, dst_name } => {
                 let label = match kind {
                     OpKind::Copy   => "Kopírování",
                     OpKind::Move   => "Přesun",
                     OpKind::Delete => "Mazání",
                 };
                 let n = files.len();
-                let (rx, flag) = spawn_file_op(kind, files, Some(dst), overwrite, self.err_flag.clone(), None);
+                let (rx, flag) = spawn_file_op(kind, files, Some(dst), overwrite, self.err_flag.clone(), dst_name);
                 self.start_op(label, rx, flag, n);
             }
             PendingAction::ZipExtract { archive_path, internal_dir, names, dst } => {
@@ -5899,6 +5945,9 @@ impl FileManagerApp {
                     "{} položek v cíli už existuje a budou přepsány, pokud zvolíš \"Přepsat vše\":",
                     self.pending_conflicts.len()
                 ));
+                ui.label(egui::RichText::new(
+                    "Existující složky se sloučí: chybějící soubory se doplní vždy, uvedené soubory \"Přeskočit existující\" ponechá beze změny.")
+                    .small().color(egui::Color32::GRAY));
                 egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                     for name in &self.pending_conflicts {
                         ui.label(name);
