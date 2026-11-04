@@ -749,6 +749,8 @@ enum PanelUiAction {
     /// Připojit sdílení zadané v adresním řádku (smb://..., nfs://...,
     /// nepřipojená GVfs cesta) a skočit do něj, případně do podsložky.
     MountNetTarget(NetTarget),
+    /// Připojit (mount=true) / odpojit blokové zařízení z roletky disků.
+    DeviceJob { device: String, mount: bool, mountpoint: Option<PathBuf> },
 }
 
 /// Akce z kontextového menu - vrací se z render_panel do update()
@@ -833,6 +835,187 @@ fn available_drives() -> Vec<String> {
     } else {
         vec!["/".to_string()]
     }
+}
+
+/// Položka v roletce disků nad panelem.
+#[derive(Clone)]
+struct DriveEntry {
+    /// Text v roletce (ikona, název, velikost)
+    label: String,
+    /// Krátký název do zavřené roletky (např. "USB_FLASH")
+    short: String,
+    hover: String,
+    /// Kam skočit; None = zařízení není připojené (klik ho připojí)
+    path: Option<PathBuf>,
+    /// Blokové zařízení (/dev/sdb1) - pro připojení/odpojení přes udisksctl
+    device: Option<String>,
+    /// Vyjímatelné (USB flash, karta) - nabídne se "⏏ Odpojit"
+    removable: bool,
+}
+
+/// Seznam disků do roletky. Windows: písmena disků. Linux: kořen, domovská
+/// složka, připojené oddíly a disky (lsblk), síťové NFS/SMB z /proc/mounts
+/// a nepřipojené vyjímatelné disky (USB flash), které jde jedním klikem
+/// připojit přes udisksctl - jako v Dolphinu. `refresh` = načíst znovu
+/// (jen při otevřené roletce, max. jednou za 2 s); jinak poslední výsledek.
+fn drive_entries(drives: &[String], refresh: bool) -> Vec<DriveEntry> {
+    if !cfg!(target_os = "linux") {
+        return drives.iter().map(|d| DriveEntry {
+            label: d.clone(), short: d.clone(), hover: d.clone(),
+            path: Some(PathBuf::from(d)), device: None, removable: false,
+        }).collect();
+    }
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<DriveEntry>)>> =
+        std::sync::Mutex::new(None);
+    let Ok(mut cache) = CACHE.lock() else { return Vec::new() };
+    let stale = DRIVES_FORCE.swap(false, Ordering::Relaxed)
+        || cache.as_ref().map_or(true, |(t, _)| t.elapsed() > std::time::Duration::from_secs(2));
+    if refresh && stale {
+        *cache = Some((std::time::Instant::now(), build_linux_drive_entries()));
+    }
+    cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+}
+
+/// Po připojení/odpojení vynutit nové načtení seznamu disků.
+fn invalidate_drive_entries() {
+    DRIVES_FORCE.store(true, Ordering::Relaxed);
+}
+static DRIVES_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// lsblk -P escapuje speciální znaky jako \xNN (mezera = \x20).
+fn lsblk_unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1] == b'x' {
+            if let Some(v) = std::str::from_utf8(&b[i + 2..i + 4]).ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Rozebere řádek `lsblk -P` (KEY="value" KEY="value" ...).
+fn parse_lsblk_pairs(line: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut rest = line.trim();
+    while let Some(eq) = rest.find("=\"") {
+        let key = rest[..eq].trim().to_string();
+        let after = &rest[eq + 2..];
+        let Some(end) = after.find('"') else { break };
+        map.insert(key, lsblk_unescape(&after[..end]));
+        rest = &after[end + 1..];
+    }
+    map
+}
+
+fn build_linux_drive_entries() -> Vec<DriveEntry> {
+    let mut out = vec![
+        DriveEntry { label: "/  kořen systému".into(), short: "/".into(), hover: "/".into(),
+                     path: Some(PathBuf::from("/")), device: None, removable: false },
+    ];
+    let home = dirs_home();
+    out.push(DriveEntry { label: "🏠 Domů".into(), short: "🏠".into(),
+        hover: home.display().to_string(), path: Some(home), device: None, removable: false });
+
+    if let Some(o) = run_cmd_timeout("lsblk",
+        &["-P", "-b", "-o", "PATH,LABEL,SIZE,FSTYPE,MOUNTPOINT,RM,HOTPLUG,TYPE"], None, 3)
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let m = parse_lsblk_pairs(line);
+            let get = |k: &str| m.get(k).cloned().unwrap_or_default();
+            let (dev, label, fstype, mp, typ) = (get("PATH"), get("LABEL"), get("FSTYPE"), get("MOUNTPOINT"), get("TYPE"));
+            if fstype.is_empty() || fstype == "swap" || typ == "loop" { continue; }
+            let removable = get("RM") == "1" || get("HOTPLUG") == "1";
+            let size = get("SIZE").parse::<u64>().map(format_size).unwrap_or_default();
+            if !mp.is_empty() {
+                // Systémové oddíly vynecháme - "/" a Domů už v seznamu jsou.
+                let system = mp == "/" || mp == "/home" || mp == "[SWAP]" || mp == "/efi"
+                    || ["/boot", "/snap", "/var", "/usr", "/tmp", "/run/user"].iter().any(|p| mp.starts_with(p));
+                if system { continue; }
+                let name = if !label.is_empty() { label.clone() } else {
+                    Path::new(&mp).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| mp.clone())
+                };
+                out.push(DriveEntry {
+                    label: format!("{} {}  ({})", if removable { "🔌" } else { "💾" }, name, size),
+                    short: name,
+                    hover: format!("{}  →  {}", dev, mp),
+                    path: Some(PathBuf::from(&mp)), device: Some(dev), removable,
+                });
+            } else if removable && fstype != "crypto_LUKS" && fstype != "BitLocker" {
+                let name = if !label.is_empty() { label.clone() } else { dev.clone() };
+                out.push(DriveEntry {
+                    label: format!("⏏ {}  ({}) - nepřipojeno", name, size),
+                    short: name,
+                    hover: format!("{} - kliknutím připojit", dev),
+                    path: None, device: Some(dev), removable: true,
+                });
+            }
+        }
+    }
+
+    // Síťové disky připojené jádrem (např. NFS z /etc/fstab)
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(src), Some(mp), Some(fstype)) = (it.next(), it.next(), it.next()) else { continue };
+            if !matches!(fstype, "nfs" | "nfs4" | "cifs" | "smb3") { continue; }
+            let mp = mp.replace("\\040", " ");
+            out.push(DriveEntry {
+                label: format!("🌐 {}", mp),
+                short: Path::new(&mp).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| mp.clone()),
+                hover: format!("{}  →  {}", src, mp),
+                path: Some(PathBuf::from(&mp)), device: None, removable: false,
+            });
+        }
+    }
+    out
+}
+
+/// Připojí (mount=true) nebo odpojí blokové zařízení přes udisksctl (bez
+/// roota - stejně jako Dolphin). Při připojení vrátí cestu přípojného bodu.
+fn udisks_device_job(device: &str, mount: bool) -> Result<Option<PathBuf>, String> {
+    let args: Vec<&str> = if mount {
+        vec!["mount", "-b", device, "--no-user-interaction"]
+    } else {
+        vec!["unmount", "-b", device, "--no-user-interaction"]
+    };
+    let out = run_cmd_timeout("udisksctl", &args, None, 30)
+        .ok_or_else(|| "Nepodařilo se spustit udisksctl (balíček udisks2) nebo nedoběhl včas.".to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !mount {
+        if !out.status.success() {
+            return Err(format!("Odpojení {} selhalo: {}", device, stderr.trim()));
+        }
+        // Vypnout napájení disku (bezpečné vytažení) - best effort.
+        let _ = run_cmd_timeout("udisksctl", &["power-off", "-b", device, "--no-user-interaction"], None, 10);
+        return Ok(None);
+    }
+    // "Mounted /dev/sdb1 at /media/user/LABEL" (případně s tečkou na konci)
+    let find_at = |text: &str| -> Option<PathBuf> {
+        let idx = text.find(" at ")?;
+        let p = text[idx + 4..].lines().next()?.trim()
+            .trim_end_matches('.').trim_matches(|c| c == '`' || c == '\'' || c == '"');
+        if p.is_empty() { None } else { Some(PathBuf::from(p)) }
+    };
+    if out.status.success() {
+        return find_at(&stdout).map(Some)
+            .ok_or_else(|| format!("Připojeno, ale nepodařilo se zjistit kam: {}", stdout.trim()));
+    }
+    // Už připojené jinde ("... is already mounted at `/media/...'")
+    if stderr.contains("already mounted") {
+        if let Some(p) = find_at(&stderr) { return Ok(Some(p)); }
+    }
+    Err(format!("Připojení {} selhalo: {}", device, stderr.trim()))
 }
 
 fn dirs_home() -> PathBuf {
@@ -3276,6 +3459,8 @@ struct FileManagerApp {
     net_browse_uri: String,
     net_browse_name: String,
     net_browse_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
+    /// Probíhající připojení/odpojení disku z roletky (udisksctl na pozadí).
+    dev_job_rx: Option<(ActivePanel, bool, Receiver<Result<Option<PathBuf>, String>>)>,
 }
 
 impl Default for FileManagerApp {
@@ -3515,6 +3700,7 @@ impl Default for FileManagerApp {
             net_browse_uri: String::new(),
             net_browse_name: String::new(),
             net_browse_rx: None,
+            dev_job_rx: None,
         };
         // Neaktivní panel připojíme bez přepnutí fokusu, levý (výchozí aktivní) s ním.
         if let Some(t) = startup_right_net { app.start_target_mount(ActivePanel::Right, t, false); }
@@ -4374,6 +4560,59 @@ impl FileManagerApp {
     /// síťové sdílení (nepřipojený GVfs mount bod ze záložky, smb://,
     /// nfs://), sdílení se nejdřív automaticky připojí - uživatel nemusí
     /// nic připojovat předem.
+    /// Připojení / odpojení disku z roletky - udisksctl běží na pozadí.
+    fn start_dev_job(&mut self, which: ActivePanel, device: String, mount: bool, mountpoint: Option<PathBuf>) {
+        if self.dev_job_rx.is_some() {
+            self.op_status = Some(StatusMsg::Warn("Počkej, ještě se dokončuje předchozí připojení/odpojení.".into()));
+            return;
+        }
+        if !mount {
+            // Panely, které jsou na odpojovaném disku, přesuneme domů.
+            if let Some(mp) = &mountpoint {
+                let home = dirs_home();
+                for panel in [&mut self.left, &mut self.right] {
+                    if panel.current_path.starts_with(mp) {
+                        panel.archive_location = None;
+                        panel.net_location = None;
+                        panel.current_path = home.clone();
+                        panel.refresh();
+                    }
+                }
+            }
+        }
+        self.op_status = Some(StatusMsg::Info(format!("{} {}...",
+            if mount { "Připojuji" } else { "Odpojuji" }, device)));
+        let (tx, rx) = channel();
+        thread::spawn(move || { let _ = tx.send(udisks_device_job(&device, mount)); });
+        self.dev_job_rx = Some((which, mount, rx));
+    }
+
+    fn poll_dev_job(&mut self, ctx: &egui::Context) {
+        let Some((which, mount, rx)) = &self.dev_job_rx else { return };
+        let (which, mount) = (*which, *mount);
+        match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => { self.dev_job_rx = None; }
+            Ok(res) => {
+                self.dev_job_rx = None;
+                invalidate_drive_entries();
+                match res {
+                    Ok(Some(path)) => {
+                        self.op_status = Some(StatusMsg::Info(format!("Připojeno: {}", path.display())));
+                        self.goto_path_in_panel(which, path, true);
+                    }
+                    Ok(None) => {
+                        self.op_status = Some(StatusMsg::Info(if mount { "Hotovo.".into() } else {
+                            "Disk odpojen - můžeš ho bezpečně vytáhnout.".into() }));
+                    }
+                    Err(e) => { self.op_status = Some(StatusMsg::Error(e)); }
+                }
+            }
+        }
+    }
+
     fn goto_path_in_panel(&mut self, which: ActivePanel, path: PathBuf, focus: bool) {
         if cfg!(target_os = "linux") && !path.is_dir() {
             if let Some(t) = parse_net_target(&path.to_string_lossy()) {
@@ -5108,6 +5347,10 @@ impl eframe::App for FileManagerApp {
                         self.active = ActivePanel::Left;
                         self.start_target_mount(ActivePanel::Left, t, true);
                     }
+                    Some(PanelUiAction::DeviceJob { device, mount, mountpoint }) => {
+                        self.active = ActivePanel::Left;
+                        self.start_dev_job(ActivePanel::Left, device, mount, mountpoint);
+                    }
                     None => {}
                 }
                 match right_action {
@@ -5123,6 +5366,10 @@ impl eframe::App for FileManagerApp {
                     Some(PanelUiAction::MountNetTarget(t)) => {
                         self.active = ActivePanel::Right;
                         self.start_target_mount(ActivePanel::Right, t, true);
+                    }
+                    Some(PanelUiAction::DeviceJob { device, mount, mountpoint }) => {
+                        self.active = ActivePanel::Right;
+                        self.start_dev_job(ActivePanel::Right, device, mount, mountpoint);
                     }
                     None => {}
                 }
@@ -5208,6 +5455,7 @@ impl eframe::App for FileManagerApp {
         self.render_net_mount_dialog(ctx);
         self.render_unmount_dialog(ctx);
         self.poll_net_browse();
+        self.poll_dev_job(ctx);
 
         // Barevné téma
         // Jen při změně - set_visuals v každém snímku nutí egui k neustálému
@@ -8141,13 +8389,22 @@ fn render_panel(
             let label = if panel.net_location.is_some() {
                 "🌐 Síť".to_string()
             } else {
-                panel.current_path.components().next()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Disk".to_string())
+                // Název disku, na kterém panel je (nejdelší odpovídající
+                // přípojný bod; bez nového načítání - jen poslední seznam).
+                drive_entries(&panel.drives, false).iter()
+                    .filter_map(|d| d.path.as_ref().map(|p| (p, &d.short)))
+                    .filter(|(p, _)| p.as_os_str().len() > 1 && panel.current_path.starts_with(p))
+                    .max_by_key(|(p, _)| p.as_os_str().len())
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_else(|| panel.current_path.components().next()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Disk".to_string()))
             };
             egui::ComboBox::from_id_source(format!("drives_{:?}", which))
                 .selected_text(label)
+                .height(500.0)
                 .show_ui(ui, |ui| {
+                    ui.set_min_width(260.0);
                     let net_item = ui.selectable_label(false, "🌐 Síť");
                     if net_item.clicked() {
                         *active = which;
@@ -8155,16 +8412,36 @@ fn render_panel(
                     }
                     net_item.surrender_focus();
                     ui.separator();
-                    for drive in panel.drives.clone() {
-                        let item = ui.selectable_label(false, &drive);
-                        if item.clicked() {
-                            *active = which;
-                            panel.archive_location = None;
-                            panel.net_location = None;
-                            panel.current_path = PathBuf::from(&drive);
-                            panel.refresh();
-                        }
-                        item.surrender_focus();
+                    for d in drive_entries(&panel.drives, true) {
+                        ui.horizontal(|ui| {
+                            let item = ui.selectable_label(false, &d.label).on_hover_text(&d.hover);
+                            if item.clicked() {
+                                *active = which;
+                                match (&d.path, &d.device) {
+                                    (Some(p), _) => {
+                                        panel.archive_location = None;
+                                        panel.net_location = None;
+                                        panel.current_path = p.clone();
+                                        panel.refresh();
+                                    }
+                                    (None, Some(dev)) => {
+                                        panel_action = Some(PanelUiAction::DeviceJob {
+                                            device: dev.clone(), mount: true, mountpoint: None });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            item.surrender_focus();
+                            if d.removable && d.path.is_some() {
+                                if let Some(dev) = &d.device {
+                                    if ui.small_button("⏏").on_hover_text("Odpojit (bezpečně vysunout)").clicked() {
+                                        *active = which;
+                                        panel_action = Some(PanelUiAction::DeviceJob {
+                                            device: dev.clone(), mount: false, mountpoint: d.path.clone() });
+                                    }
+                                }
+                            }
+                        });
                     }
                 });
             let star_w = 28.0;
