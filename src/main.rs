@@ -926,21 +926,33 @@ fn build_linux_drive_entries() -> Vec<DriveEntry> {
     out.push(DriveEntry { label: "🏠 Domů".into(), short: "🏠".into(),
         hover: home.display().to_string(), path: Some(home), device: None, removable: false });
 
-    if let Some(o) = run_cmd_timeout("lsblk",
-        &["-P", "-b", "-o", "PATH,LABEL,SIZE,FSTYPE,MOUNTPOINT,RM,HOTPLUG,TYPE"], None, 3)
-    {
+    // MOUNTPOINTS (všechny přípojné body) - Btrfs má jeden oddíl připojený
+    // vícekrát (subvolumy /, /home, /swap...) a MOUNTPOINT ukáže jen jeden
+    // z nich, třeba /swap. Starší lsblk sloupec MOUNTPOINTS nezná.
+    let lsblk = |cols: &str| run_cmd_timeout("lsblk", &["-P", "-b", "-o", cols], None, 3)
+        .filter(|o| o.status.success());
+    let lsblk_out = lsblk("PATH,LABEL,SIZE,FSTYPE,MOUNTPOINTS,RM,HOTPLUG,TYPE")
+        .or_else(|| lsblk("PATH,LABEL,SIZE,FSTYPE,MOUNTPOINT,RM,HOTPLUG,TYPE"));
+    if let Some(o) = lsblk_out {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
             let m = parse_lsblk_pairs(line);
             let get = |k: &str| m.get(k).cloned().unwrap_or_default();
-            let (dev, label, fstype, mp, typ) = (get("PATH"), get("LABEL"), get("FSTYPE"), get("MOUNTPOINT"), get("TYPE"));
+            let (dev, label, fstype, typ) = (get("PATH"), get("LABEL"), get("FSTYPE"), get("TYPE"));
+            let mps: Vec<String> = m.get("MOUNTPOINTS").or_else(|| m.get("MOUNTPOINT"))
+                .map(|v| v.split('\n').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                .unwrap_or_default();
             if fstype.is_empty() || fstype == "swap" || typ == "loop" { continue; }
             let removable = get("RM") == "1" || get("HOTPLUG") == "1";
             let size = get("SIZE").parse::<u64>().map(format_size).unwrap_or_default();
-            if !mp.is_empty() {
-                // Systémové oddíly vynecháme - "/" a Domů už v seznamu jsou.
-                let system = mp == "/" || mp == "/home" || mp == "[SWAP]" || mp == "/efi"
-                    || ["/boot", "/snap", "/var", "/usr", "/tmp", "/run/user"].iter().any(|p| mp.starts_with(p));
-                if system { continue; }
+            if !mps.is_empty() {
+                // Systémový oddíl (připojený mimo jiné jako /, /home, /swap,
+                // /boot...) vynecháme celý - "/" a Domů už v seznamu jsou.
+                let is_system = |mp: &str| mp == "/" || mp == "/home" || mp == "[SWAP]" || mp == "/efi"
+                    || ["/boot", "/snap", "/var", "/usr", "/tmp", "/run/user", "/swap", "/root", "/srv", "/opt", "/.snapshots"]
+                        .iter().any(|p| mp.starts_with(p));
+                if mps.iter().any(|mp| is_system(mp)) { continue; }
+                // Nejkratší přípojný bod (u více subvolumů obvykle kořen)
+                let mp = mps.iter().min_by_key(|p| p.len()).cloned().unwrap_or_default();
                 let name = if !label.is_empty() { label.clone() } else {
                     Path::new(&mp).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| mp.clone())
                 };
@@ -1255,6 +1267,7 @@ const SETTINGS_KEYS: [&str; 8] = [
     "DARK_MODE=", "SHOW_HIDDEN=", "DIR_SORT=", "COLOR_GROUPS_SET=",
     "BM_NAME=", "SEL_COLOR=", "EXT_EDITOR=", "RENAME_SELECT_EXT=",
 ];
+// (PRESERVE_TIMES= se ukládá také, k rozpoznání zálohy stačí klíče výše)
 
 /// Spustí externí dialog pro výběr souboru. `None` = nástroj není
 /// nainstalovaný (zkusí se další), `Some(None)` = uživatel zrušil.
@@ -1480,6 +1493,48 @@ fn delete_path(path: &Path) -> std::io::Result<()> {
 /// Po kolika bajtech se při zápisu na síťovou složku čeká na skutečné
 /// odeslání dat (viz flush_written).
 const NET_FLUSH_CHUNK: u64 = 16 * 1024 * 1024;
+/// Totéž pro vyjímatelné disky (USB flash, karta) - menší úsek, ať je
+/// průběh plynulý i při rychlosti flashky (jednotky až desítky MB/s).
+const USB_FLUSH_CHUNK: u64 = 4 * 1024 * 1024;
+
+/// Leží cesta na vyjímatelném disku (USB flash/disk, SD karta)? Linux:
+/// zařízení přípojného bodu z /proc/mounts → /sys/class/block; USB disk
+/// pozná podle "/usb" v cestě zařízení v sysfs (USB SSD se často hlásí
+/// jako nevyjímatelný), jinak podle /sys/block/<disk>/removable.
+fn is_removable_path(p: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(mounts) = fs::read_to_string("/proc/mounts") else { return false };
+        let mut best: Option<(usize, String)> = None;
+        for line in mounts.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(dev), Some(mp)) = (it.next(), it.next()) else { continue };
+            let mp = mp.replace("\\040", " ");
+            if p.starts_with(&mp) && best.as_ref().map_or(true, |(len, _)| mp.len() >= *len) {
+                best = Some((mp.len(), dev.to_string()));
+            }
+        }
+        let Some((_, dev)) = best else { return false };
+        if !dev.starts_with("/dev/") { return false; }
+        let dev = fs::canonicalize(&dev).unwrap_or_else(|_| PathBuf::from(&dev));
+        let Some(name) = dev.file_name().map(|n| n.to_string_lossy().into_owned()) else { return false };
+        let Ok(sys) = fs::canonicalize(format!("/sys/class/block/{}", name)) else { return false };
+        if sys.to_string_lossy().contains("/usb") || name.starts_with("mmcblk") {
+            return true;
+        }
+        // Oddíl (sdb1) → disk (sdb)
+        let disk = if sys.join("partition").exists() {
+            sys.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned())
+        } else { Some(name) };
+        disk.and_then(|d| fs::read_to_string(format!("/sys/block/{}/removable", d)).ok())
+            .map_or(false, |v| v.trim() == "1")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = p;
+        false
+    }
+}
 
 /// Je cesta na síťovém souborovém systému? Linux: podle typu FS v
 /// /proc/mounts (nejdelší odpovídající přípojný bod; u autofs + NFS na
@@ -1550,6 +1605,29 @@ fn create_dst_file(dst: &Path) -> std::io::Result<fs::File> {
     fs::File::create(dst)
 }
 
+/// Přenese datum a čas změny (a posledního přístupu) ze zdroje na cíl.
+/// Best effort - na některých síťových FS (GVfs) to nemusí jít.
+fn copy_file_times(src_meta: &fs::Metadata, dst: &fs::File) {
+    let mut t = fs::FileTimes::new();
+    if let Ok(m) = src_meta.modified() { t = t.set_modified(m); }
+    if let Ok(a) = src_meta.accessed() { t = t.set_accessed(a); }
+    let _ = dst.set_times(t);
+}
+
+/// Totéž pro složku (na Windows jde složku otevřít jen s
+/// FILE_FLAG_BACKUP_SEMANTICS a právem FILE_WRITE_ATTRIBUTES).
+fn copy_dir_times(src: &Path, dst: &Path) {
+    let Ok(meta) = fs::metadata(src) else { return };
+    #[cfg(windows)]
+    let f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new().access_mode(0x0100).custom_flags(0x0200_0000).open(dst)
+    };
+    #[cfg(not(windows))]
+    let f = fs::File::open(dst);
+    if let Ok(f) = f { copy_file_times(&meta, &f); }
+}
+
 /// Jedna položka práce pro vlákna operace: jeden soubor (u kopírování a
 /// přesunu se složky předem rozloží na jednotlivé soubory, aby šlo ukázat
 /// průběh každého z nich), nebo jedna mazaná položka.
@@ -1576,6 +1654,7 @@ fn spawn_file_op(
     overwrite: bool,
     err_flag: Arc<AtomicU8>,
     dst_name: Option<String>,  // přejmenování při kopírování jednoho souboru
+    preserve_times: bool,      // zachovat původní datum a čas souborů/složek
 ) -> (Receiver<OpMsg>, OpFlag) {
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use rayon::prelude::*;
@@ -1596,6 +1675,9 @@ fn spawn_file_op(
         // Zdrojové složky přesouvané přes disky - smažou se až na konci,
         // pokud se z nich všechno přeneslo.
         let mut move_dirs: Vec<PathBuf> = Vec::new();
+        // Vytvořené cílové složky (zdroj, cíl) - datum a čas se jim nastaví
+        // až na konci, protože zápis souborů dovnitř ho mění.
+        let mut dir_times: Vec<(PathBuf, PathBuf)> = Vec::new();
 
         for src in &files {
             if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
@@ -1654,6 +1736,8 @@ fn spawn_file_op(
                         if let Err(e) = fs::create_dir_all(&d) {
                             jobs.push(OpJob { src: entry.path().to_path_buf(), dst: d, label,
                                               size: 0, remove_src: false, fail: Some(e.to_string()) });
+                        } else {
+                            dir_times.push((entry.path().to_path_buf(), d));
                         }
                     } else if entry.path().is_file() {
                         if !overwrite && d.exists() {
@@ -1686,7 +1770,15 @@ fn spawn_file_op(
         // je beztak jedno, paralelismus by nic nezrychlil.
         let network = dst_dir.as_deref().map_or(false, is_network_path)
             || files.iter().any(|f| is_network_path(f));
-        let num_threads  = if network { 1 } else { 4.min(jobs.len()).max(1) };
+        // USB flash / karta: jádro by celý soubor přijalo do RAM během
+        // vteřiny (průběh hned 100 %) a skutečný zápis by se pak táhl bez
+        // pohybu. Proto stejně jako u sítě průběžné odesílání dat na disk
+        // (flush_written) a jen jedno vlákno - flashky souběžný zápis víc
+        // souborů zpomaluje.
+        let removable = dst_dir.as_deref().map_or(false, is_removable_path);
+        let flush_chunk = if network { Some(NET_FLUSH_CHUNK) }
+            else if removable { Some(USB_FLUSH_CHUNK) } else { None };
+        let num_threads  = if network || removable { 1 } else { 4.min(jobs.len()).max(1) };
         let done_counter = Arc::new(AtomicUsize::new(renamed + skipped));
         let bytes_global = Arc::new(AtomicU64::new(0));
         let failed       = Arc::new(AtomicUsize::new(0));
@@ -1732,15 +1824,27 @@ fn spawn_file_op(
                         if n == 0 { break; }
                         dst_file.write_all(&buf[..n])?;
                         written += n as u64;
-                        if network && written - synced >= NET_FLUSH_CHUNK {
-                            flush_written(&dst_file, synced, written - synced);
-                            synced = written;
+                        if let Some(chunk) = flush_chunk {
+                            if written - synced >= chunk {
+                                flush_written(&dst_file, synced, written - synced);
+                                synced = written;
+                            }
                         }
                         let bytes = bytes_global.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
                         if let Ok(t) = tx.lock() {
                             let _ = t.send(OpMsg::SlotProgress { thread_id, bytes_copied: n as u64 });
                             let done = done_counter.load(Ordering::Relaxed);
                             let _ = t.send(OpMsg::Progress { done, total, bytes_done: bytes, bytes_total });
+                        }
+                    }
+                    // Zbytek souboru taky odeslat, ať se soubor neoznačí
+                    // za hotový, zatímco se jeho konec ještě zapisuje.
+                    if flush_chunk.is_some() && written > synced {
+                        flush_written(&dst_file, synced, written - synced);
+                    }
+                    if preserve_times && flag_thread.load(Ordering::Relaxed) != OP_STOP {
+                        if let Ok(meta) = src_file.metadata() {
+                            copy_file_times(&meta, &dst_file);
                         }
                     }
                     Ok(())
@@ -1808,6 +1912,13 @@ fn spawn_file_op(
         });
 
         let stopped = flag_thread.load(Ordering::Relaxed) == OP_STOP;
+        // Datum a čas složek - od nejhlubší (WalkDir vrací rodiče před
+        // potomky), ať nastavení podsložky znovu nezmění rodiče.
+        if preserve_times && !stopped {
+            for (src, dst) in dir_times.iter().rev() {
+                copy_dir_times(src, dst);
+            }
+        }
         // Přesun složky: ve zdroji smazat jen složky, které po přesunu
         // zůstaly PRÁZDNÉ (od nejhlubší). Přeskočené nebo chybové soubory
         // tak ve zdroji zůstanou i se svými složkami.
@@ -3318,6 +3429,8 @@ struct FileManagerApp {
     // Při F2/inline rename rovnou označit i příponu souboru (false = jen
     // název bez přípony, jako v Průzkumníku/Total Commanderu)
     rename_select_ext: bool,
+    /// Kopírování/přesun: zachovat původní datum a čas (výchozí ano).
+    preserve_times: bool,
     color_groups: Vec<ColorGroup>,
     /// Barva textu označených souborů (Nastavení → Vzhled)
     sel_color: [u8; 3],
@@ -3567,7 +3680,8 @@ impl Default for FileManagerApp {
             rename_single_new: String::new(),
             rename_single_error: None,
             show_select_mask: false,
-            select_mask: "*.".to_string(),
+            // "*" = vše včetně složek (rychlé označení všeho přes "+").
+            select_mask: "*".to_string(),
             select_mask_add: true,
             show_new_dir: false,
             new_dir_name: String::new(),
@@ -3606,6 +3720,10 @@ impl Default for FileManagerApp {
                     .find(|l| l.starts_with("RENAME_SELECT_EXT="))
                     .map(|l| l["RENAME_SELECT_EXT=".len()..].trim() == "true"))
                 .unwrap_or(false),
+            preserve_times: fs::read_to_string(state_file_path()).ok()
+                .and_then(|c| c.lines()
+                    .find_map(|l| l.strip_prefix("PRESERVE_TIMES=").map(|v| v.trim() != "false")))
+                .unwrap_or(true),
             color_groups: color_groups_init.clone(),
             sel_color: fs::read_to_string(state_file_path()).ok()
                 .and_then(|c| c.lines()
@@ -3882,7 +4000,7 @@ impl FileManagerApp {
         if conflicts.is_empty() {
             let label = if kind == OpKind::Copy { "Kopírování" } else { "Přesun" };
             let n = files.len();
-            let (rx, flag) = spawn_file_op(kind, files, Some(dst), true, self.err_flag.clone(), dst_name);
+            let (rx, flag) = spawn_file_op(kind, files, Some(dst), true, self.err_flag.clone(), dst_name, self.preserve_times);
             self.start_op(label, rx, flag, n);
         } else {
             self.pending_conflicts = conflicts;
@@ -3902,7 +4020,7 @@ impl FileManagerApp {
                     OpKind::Delete => "Mazání",
                 };
                 let n = files.len();
-                let (rx, flag) = spawn_file_op(kind, files, Some(dst), overwrite, self.err_flag.clone(), dst_name);
+                let (rx, flag) = spawn_file_op(kind, files, Some(dst), overwrite, self.err_flag.clone(), dst_name, self.preserve_times);
                 self.start_op(label, rx, flag, n);
             }
             PendingAction::ZipExtract { archive_path, internal_dir, names, dst } => {
@@ -4262,6 +4380,7 @@ impl FileManagerApp {
         content.push_str(&format!("SHOW_HIDDEN={}\n", self.show_hidden));
         content.push_str(&format!("EXT_EDITOR={}\n",  self.external_editor));
         content.push_str(&format!("RENAME_SELECT_EXT={}\n", self.rename_select_ext));
+        content.push_str(&format!("PRESERVE_TIMES={}\n", self.preserve_times));
         content.push_str(&format!("DIR_SORT={}\n", match self.dir_sort {
             DirSort::FirstByName => "FirstByName",
             DirSort::FirstByCol  => "FirstByCol",
@@ -4300,6 +4419,7 @@ impl FileManagerApp {
         self.show_hidden = get("SHOW_HIDDEN=").map_or(false, |v| v == "true");
         self.external_editor = get("EXT_EDITOR=").unwrap_or_default();
         self.rename_select_ext = get("RENAME_SELECT_EXT=").map_or(false, |v| v == "true");
+        self.preserve_times = get("PRESERVE_TIMES=").map_or(true, |v| v != "false");
         self.dir_sort = match get("DIR_SORT=").as_deref() {
             Some("FirstByName") => DirSort::FirstByName,
             Some("Mixed")       => DirSort::Mixed,
@@ -4654,7 +4774,7 @@ impl FileManagerApp {
     fn confirm_delete(&mut self) {
         let files = std::mem::take(&mut self.delete_targets);
         let n = files.len();
-        let (rx, flag) = spawn_file_op(OpKind::Delete, files, None, true, self.err_flag.clone(), None);
+        let (rx, flag) = spawn_file_op(OpKind::Delete, files, None, true, self.err_flag.clone(), None, false);
         self.start_op("Mazání", rx, flag, n);
         self.show_delete_confirm = false;
     }
@@ -6654,6 +6774,21 @@ impl FileManagerApp {
                         "Když je vypnuto (výchozí), označí se jen název bez přípony - jako v Průzkumníku/Total Commanderu.")
                         .small().color(egui::Color32::GRAY));
                     if self.rename_select_ext != was { changed = true; }
+                });
+
+                ui.add_space(8.0);
+
+                // Kopírování a přesun
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Kopírování a přesun").strong());
+                    ui.separator();
+                    let was = self.preserve_times;
+                    ui.checkbox(&mut self.preserve_times,
+                        "Zachovat původní datum a čas souborů a složek");
+                    ui.label(egui::RichText::new(
+                        "Když je vypnuto, zkopírované soubory a složky dostanou aktuální datum a čas. Přesun v rámci jednoho disku datum zachová vždy.")
+                        .small().color(egui::Color32::GRAY));
+                    if self.preserve_times != was { changed = true; }
                 });
 
                 ui.add_space(8.0);
