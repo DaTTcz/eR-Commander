@@ -5470,7 +5470,7 @@ impl FileManagerApp {
 
         let nav_free = !any_text_dialog && !editing_path;
 
-        let (tab, up, down, page_up, page_down, home, end, space, enter, del, f2) =
+        let (tab, up, down, page_up, page_down, home, end, space, enter, del, f2, insert) =
             ctx.input_mut(|i| {
                 (
                     false, // Tab zpracován v update() před handle_shortcuts
@@ -5486,6 +5486,7 @@ impl FileManagerApp {
                     } else { false },
                     if nav_free { i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)    } else { false },
                     false,
+                    if nav_free { i.consume_key(egui::Modifiers::NONE, egui::Key::Insert)    } else { false },
                 )
             });
 
@@ -5656,6 +5657,13 @@ impl FileManagerApp {
         if space {
             self.active_panel_mut().toggle_selection_at_cursor();
             self.start_dir_size_calc();
+        }
+        // Insert = označit/odznačit a posunout kurzor dolů (jako Total
+        // Commander) - opakovaným Insertem se označí řada souborů za sebou.
+        if insert {
+            self.active_panel_mut().toggle_selection_at_cursor();
+            self.start_dir_size_calc();
+            self.active_panel_mut().move_cursor(1);
         }
         if enter {
             match self.active_panel_mut().activate_cursor() {
