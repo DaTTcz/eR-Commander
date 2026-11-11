@@ -856,24 +856,52 @@ struct DriveEntry {
 /// Seznam disků do roletky. Windows: písmena disků. Linux: kořen, domovská
 /// složka, připojené oddíly a disky (lsblk), síťové NFS/SMB z /proc/mounts
 /// a nepřipojené vyjímatelné disky (USB flash), které jde jedním klikem
-/// připojit přes udisksctl - jako v Dolphinu. `refresh` = načíst znovu
-/// (jen při otevřené roletce, max. jednou za 2 s); jinak poslední výsledek.
-fn drive_entries(drives: &[String], refresh: bool) -> Vec<DriveEntry> {
+/// připojit přes udisksctl - jako v Dolphinu.
+/// `refresh` = Some(ctx) při otevřené roletce: seznam se načte znovu na
+/// pozadí (nejvýš jednou za 1 s, UI nečeká) a po načtení se roletka
+/// překreslí. None = jen poslední výsledek (popisek zavřené roletky).
+fn drive_entries(drives: &[String], refresh: Option<&egui::Context>) -> Vec<DriveEntry> {
     if !cfg!(target_os = "linux") {
         return drives.iter().map(|d| DriveEntry {
             label: d.clone(), short: d.clone(), hover: d.clone(),
             path: Some(PathBuf::from(d)), device: None, removable: false,
         }).collect();
     }
-    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<DriveEntry>)>> =
-        std::sync::Mutex::new(None);
-    let Ok(mut cache) = CACHE.lock() else { return Vec::new() };
-    let stale = DRIVES_FORCE.swap(false, Ordering::Relaxed)
-        || cache.as_ref().map_or(true, |(t, _)| t.elapsed() > std::time::Duration::from_secs(2));
-    if refresh && stale {
-        *cache = Some((std::time::Instant::now(), build_linux_drive_entries()));
+    let Ok(mut st) = DRIVE_STATE.lock() else { return Vec::new() };
+    if let Some(ctx) = refresh {
+        let stale = DRIVES_FORCE.swap(false, Ordering::Relaxed)
+            || st.at.map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(1));
+        if stale && !st.loading {
+            st.loading = true;
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let (list, err) = build_linux_drive_entries();
+                if let Ok(mut st) = DRIVE_STATE.lock() {
+                    st.list = list;
+                    st.error = err;
+                    st.at = Some(std::time::Instant::now());
+                    st.loading = false;
+                }
+                ctx.request_repaint();
+            });
+        }
     }
-    cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+    st.list.clone()
+}
+
+/// Stav seznamu disků (načítá se na pozadí).
+struct DriveState {
+    list: Vec<DriveEntry>,
+    at: Option<std::time::Instant>,
+    loading: bool,
+    /// Chyba z lsblk (zobrazí se v roletce - pro diagnostiku)
+    error: Option<String>,
+}
+static DRIVE_STATE: std::sync::Mutex<DriveState> = std::sync::Mutex::new(DriveState {
+    list: Vec::new(), at: None, loading: false, error: None,
+});
+fn drive_entries_error() -> Option<String> {
+    DRIVE_STATE.lock().ok().and_then(|s| s.error.clone())
 }
 
 /// Po připojení/odpojení vynutit nové načtení seznamu disků.
@@ -917,7 +945,8 @@ fn parse_lsblk_pairs(line: &str) -> std::collections::HashMap<String, String> {
     map
 }
 
-fn build_linux_drive_entries() -> Vec<DriveEntry> {
+fn build_linux_drive_entries() -> (Vec<DriveEntry>, Option<String>) {
+    let mut error: Option<String> = None;
     let mut out = vec![
         DriveEntry { label: "/  kořen systému".into(), short: "/".into(), hover: "/".into(),
                      path: Some(PathBuf::from("/")), device: None, removable: false },
@@ -929,10 +958,13 @@ fn build_linux_drive_entries() -> Vec<DriveEntry> {
     // MOUNTPOINTS (všechny přípojné body) - Btrfs má jeden oddíl připojený
     // vícekrát (subvolumy /, /home, /swap...) a MOUNTPOINT ukáže jen jeden
     // z nich, třeba /swap. Starší lsblk sloupec MOUNTPOINTS nezná.
-    let lsblk = |cols: &str| run_cmd_timeout("lsblk", &["-P", "-b", "-o", cols], None, 3)
+    let lsblk = |cols: &str| run_cmd_timeout("lsblk", &["-P", "-b", "-o", cols], None, 10)
         .filter(|o| o.status.success());
     let lsblk_out = lsblk("PATH,LABEL,SIZE,FSTYPE,MOUNTPOINTS,RM,HOTPLUG,TYPE")
         .or_else(|| lsblk("PATH,LABEL,SIZE,FSTYPE,MOUNTPOINT,RM,HOTPLUG,TYPE"));
+    if lsblk_out.is_none() {
+        error = Some("Seznam disků se nepodařilo načíst (lsblk selhal nebo nedoběhl).".to_string());
+    }
     if let Some(o) = lsblk_out {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
             let m = parse_lsblk_pairs(line);
@@ -989,7 +1021,7 @@ fn build_linux_drive_entries() -> Vec<DriveEntry> {
             });
         }
     }
-    out
+    (out, error)
 }
 
 /// Připojí (mount=true) nebo odpojí blokové zařízení přes udisksctl (bez
@@ -1536,6 +1568,26 @@ fn is_removable_path(p: &Path) -> bool {
     }
 }
 
+/// "Otisk" obsahu složky (jména, velikosti, časy změny) - pro zjištění
+/// změn na síťových discích, kde inotify nevidí změny z jiných počítačů.
+fn dir_fingerprint(p: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(rd) = fs::read_dir(p) {
+        let mut items: Vec<(String, u64, Option<SystemTime>)> = rd.flatten().map(|e| {
+            let m = e.metadata().ok();
+            (e.file_name().to_string_lossy().into_owned(),
+             m.as_ref().map_or(0, |m| m.len()),
+             m.and_then(|m| m.modified().ok()))
+        }).collect();
+        items.sort();
+        items.hash(&mut h);
+    } else {
+        0u8.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Je cesta na síťovém souborovém systému? Linux: podle typu FS v
 /// /proc/mounts (nejdelší odpovídající přípojný bod; u autofs + NFS na
 /// stejném místě vyhraje to, co je připojené navrch, tedy NFS), plus
@@ -2074,6 +2126,7 @@ fn spawn_zip_extract(
     dst_dir: PathBuf,
     overwrite: bool,
     err_flag: Arc<AtomicU8>,
+    dst_name: Option<String>,  // přejmenování jedné rozbalované položky
 ) -> (Receiver<OpMsg>, OpFlag) {
     let (tx, rx) = channel();
     let flag: OpFlag = Arc::new(AtomicU8::new(OP_RUN));
@@ -2116,7 +2169,13 @@ fn spawn_zip_extract(
             });
             if !matched { continue; }
 
-            let out_path = dst_dir.join(rest);
+            // Přejmenování: první část cesty (vybraná položka) -> nové jméno
+            let out_rel = match (&dst_name, selected_names.as_slice()) {
+                (Some(new), [sel]) if rest == sel.as_str() => new.clone(),
+                (Some(new), [sel]) => format!("{}{}", new, &rest[sel.len()..]),
+                _ => rest.to_string(),
+            };
+            let out_path = dst_dir.join(&out_rel);
             if entry.is_dir() {
                 let _ = fs::create_dir_all(&out_path);
                 continue;
@@ -2335,6 +2394,7 @@ enum PendingAction {
         internal_dir: String,
         names: Vec<String>,
         dst: PathBuf,
+        dst_name: Option<String>,
     },
 }
 
@@ -3370,6 +3430,9 @@ struct FileManagerApp {
     show_copy_confirm: bool,
     copy_move_kind: OpKind,
     copy_targets: Vec<PathBuf>,
+    /// F5 z otevřeného ZIPu: (archiv, vnitřní složka, vybraná jména) -
+    /// potvrzovací dialog je stejný, rozbalí se místo kopírování.
+    copy_zip: Option<(PathBuf, String, Vec<String>)>,
     copy_dst: PathBuf,
     copy_focus: usize,
     copy_new_name: String,
@@ -3487,6 +3550,12 @@ struct FileManagerApp {
     // Sledování změn v souborovém systému (auto-refresh)
     fs_watcher: Option<RecommendedWatcher>,
     fs_rx: Option<std::sync::mpsc::Receiver<Result<FsEvent, notify::Error>>>,
+    /// Síťové složky (CIFS/NFS/GVfs): inotify nevidí změny z jiných
+    /// počítačů, proto se jejich obsah kontroluje každé 3 s na pozadí.
+    net_poll_rx: Option<Receiver<Vec<(ActivePanel, PathBuf, u64)>>>,
+    net_poll_last: [Option<(PathBuf, u64)>; 2],
+    net_poll_at: std::time::Instant,
+    net_poll_any: bool,
     watched_left: PathBuf,
     watched_right: PathBuf,
 
@@ -3656,6 +3725,7 @@ impl Default for FileManagerApp {
             show_copy_confirm: false,
             copy_move_kind: OpKind::Copy,
             copy_targets: Vec::new(),
+            copy_zip: None,
             copy_dst: PathBuf::new(),
             copy_focus: 0,
             copy_new_name: String::new(),
@@ -3770,6 +3840,10 @@ impl Default for FileManagerApp {
             last_saved_right: right_path,
             fs_watcher: None,
             fs_rx: None,
+            net_poll_rx: None,
+            net_poll_last: [None, None],
+            net_poll_at: std::time::Instant::now(),
+            net_poll_any: false,
             watched_left: PathBuf::new(),
             watched_right: PathBuf::new(),
             dir_size_rx: None,
@@ -3930,27 +4004,25 @@ impl FileManagerApp {
     fn start_copy(&mut self) {
         let panel = self.active_panel();
 
-        // ZIP archiv - bez confirm dialogu, rovnou na přesun/konflikt
+        // ZIP archiv - stejný potvrzovací dialog (s přejmenováním u jedné
+        // položky), po potvrzení se vybrané položky rozbalí do cíle.
         if let Some(loc) = panel.archive_location.clone() {
             let names = panel.effective_names();
             if names.is_empty() { return; }
             let dst = self.inactive_dir();
-            let conflicts = names_conflicting(&names, &dst);
-            if conflicts.is_empty() {
-                let n = names.len();
-                let (rx, flag) = spawn_zip_extract(loc.archive_path, loc.internal_dir, names, dst, true, self.err_flag.clone());
-                self.start_op("Rozbaluji ZIP", rx, flag, n);
-            } else {
-                self.pending_conflicts = conflicts;
-                self.overwrite_focus = 0;
-                self.pending_action = Some(PendingAction::ZipExtract {
-                    archive_path: loc.archive_path, internal_dir: loc.internal_dir, names, dst,
-                });
-            }
+            // Pro zobrazení v dialogu: archiv.zip/vnitřní/cesta/jméno
+            let shown_base = loc.archive_path.join(loc.internal_dir.trim_end_matches('/'));
+            self.copy_targets = names.iter().map(|n| shown_base.join(n)).collect();
+            self.copy_new_name = if names.len() == 1 { names[0].clone() } else { String::new() };
+            self.copy_zip = Some((loc.archive_path, loc.internal_dir, names));
+            self.copy_dst = dst;
+            self.copy_move_kind = OpKind::Copy;
+            self.copy_focus = 0;
+            self.show_copy_confirm = true;
             return;
         }
-
         let files = panel.effective_paths();
+        self.copy_zip = None;
         if files.is_empty() { return; }
         let dst = self.inactive_dir();
         // Při jednom souboru předvyplníme jméno pro případné přejmenování
@@ -3969,6 +4041,7 @@ impl FileManagerApp {
             self.op_status = Some(StatusMsg::Error("Přesun uvnitř archivu není podporovaný.".to_string()));
             return;
         }
+        self.copy_zip = None;
         let files = self.active_panel().effective_paths();
         if files.is_empty() { return; }
         let dst = self.inactive_dir();
@@ -3988,6 +4061,29 @@ impl FileManagerApp {
         let kind     = self.copy_move_kind;
         let new_name = self.copy_new_name.trim().to_string();
         self.show_copy_confirm = false;
+
+        if let Some((archive_path, internal_dir, names)) = self.copy_zip.take() {
+            let dst_name = if names.len() == 1 && !new_name.is_empty() && new_name != names[0] {
+                Some(new_name)
+            } else { None };
+            let check: Vec<String> = match &dst_name {
+                Some(n) => vec![n.clone()],
+                None => names.clone(),
+            };
+            let conflicts = names_conflicting(&check, &dst);
+            if conflicts.is_empty() {
+                let n = names.len();
+                let (rx, flag) = spawn_zip_extract(archive_path, internal_dir, names, dst, true, self.err_flag.clone(), dst_name);
+                self.start_op("Rozbaluji ZIP", rx, flag, n);
+            } else {
+                self.pending_conflicts = conflicts;
+                self.overwrite_focus = 0;
+                self.pending_action = Some(PendingAction::ZipExtract {
+                    archive_path, internal_dir, names, dst, dst_name,
+                });
+            }
+            return;
+        }
 
         // dst_name: přejmenování při kopírování jednoho souboru
         let dst_name = if files.len() == 1 && !new_name.is_empty() {
@@ -4023,9 +4119,9 @@ impl FileManagerApp {
                 let (rx, flag) = spawn_file_op(kind, files, Some(dst), overwrite, self.err_flag.clone(), dst_name, self.preserve_times);
                 self.start_op(label, rx, flag, n);
             }
-            PendingAction::ZipExtract { archive_path, internal_dir, names, dst } => {
+            PendingAction::ZipExtract { archive_path, internal_dir, names, dst, dst_name } => {
                 let n = names.len();
-                let (rx, flag) = spawn_zip_extract(archive_path, internal_dir, names, dst, overwrite, self.err_flag.clone());
+                let (rx, flag) = spawn_zip_extract(archive_path, internal_dir, names, dst, overwrite, self.err_flag.clone(), dst_name);
                 self.start_op("Rozbaluji ZIP", rx, flag, n);
             }
         }
@@ -4203,6 +4299,65 @@ impl FileManagerApp {
                 self.fs_rx      = None;
             }
         }
+    }
+
+    /// Síťové složky: každé 3 s na pozadí spočítá otisk obsahu a při změně
+    /// panel znovu načte. Jinak by nové soubory od ostatních (sdílená
+    /// složka na serveru) bylo vidět až po opuštění a návratu do složky.
+    fn poll_net_dirs(&mut self, ctx: &egui::Context) {
+        const PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
+        if let Some(rx) = self.net_poll_rx.take() {
+            match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.net_poll_rx = Some(rx);
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Ok(results) => {
+                    self.net_poll_any = !results.is_empty();
+                    for (which, path, fp) in results {
+                        let idx = if which == ActivePanel::Left { 0 } else { 1 };
+                        let changed = matches!(&self.net_poll_last[idx],
+                            Some((p, old)) if *p == path && *old != fp);
+                        self.net_poll_last[idx] = Some((path.clone(), fp));
+                        let panel = if idx == 0 { &mut self.left } else { &mut self.right };
+                        if changed && panel.current_path == path
+                            && panel.archive_location.is_none() && panel.net_location.is_none()
+                        {
+                            panel.refresh();
+                        }
+                    }
+                }
+            }
+        }
+        if self.net_poll_any {
+            ctx.request_repaint_after(PERIOD);
+        }
+        // Během kopírování nekontrolujeme (stat na NFS by čekal na zápis).
+        if self.net_poll_at.elapsed() < PERIOD || self.op_rx.is_some() {
+            return;
+        }
+        self.net_poll_at = std::time::Instant::now();
+        let targets: Vec<(ActivePanel, PathBuf)> = [
+            (ActivePanel::Left, &self.left), (ActivePanel::Right, &self.right),
+        ].into_iter()
+            .filter(|(_, p)| p.archive_location.is_none() && p.net_location.is_none())
+            .map(|(w, p)| (w, p.current_path.clone()))
+            .collect();
+        let (tx, rx) = channel();
+        let wake = ctx.clone();
+        thread::spawn(move || {
+            let results: Vec<(ActivePanel, PathBuf, u64)> = targets.into_iter()
+                .filter(|(_, p)| is_network_path(p))
+                .map(|(w, p)| { let fp = dir_fingerprint(&p); (w, p, fp) })
+                .collect();
+            let any = !results.is_empty();
+            let _ = tx.send(results);
+            // Jen u síťové složky probudit UI (jinak by appka v klidu
+            // zbytečně překreslovala).
+            if any { wake.request_repaint(); }
+        });
+        self.net_poll_rx = Some(rx);
     }
 
     /// Zpracuje události z file system watcheru - při změně refreshne panel.
@@ -5346,6 +5501,7 @@ impl eframe::App for FileManagerApp {
         self.poll_search();
         self.poll_hash();
         self.poll_fs_events();
+        self.poll_net_dirs(ctx);
         self.poll_dir_sizes();
         self.update_watcher(ctx);
 
@@ -8526,7 +8682,9 @@ fn render_panel(
             } else {
                 // Název disku, na kterém panel je (nejdelší odpovídající
                 // přípojný bod; bez nového načítání - jen poslední seznam).
-                drive_entries(&panel.drives, false).iter()
+                // (Jen úplně poprvé se seznam načte na pozadí.)
+                let first = DRIVE_STATE.lock().map_or(false, |s| s.at.is_none());
+                drive_entries(&panel.drives, if first { Some(ui.ctx()) } else { None }).iter()
                     .filter_map(|d| d.path.as_ref().map(|p| (p, &d.short)))
                     .filter(|(p, _)| p.as_os_str().len() > 1 && panel.current_path.starts_with(p))
                     .max_by_key(|(p, _)| p.as_os_str().len())
@@ -8547,7 +8705,11 @@ fn render_panel(
                     }
                     net_item.surrender_focus();
                     ui.separator();
-                    for d in drive_entries(&panel.drives, true) {
+                    let entries = drive_entries(&panel.drives, Some(ui.ctx()));
+                    if let Some(err) = drive_entries_error() {
+                        ui.label(egui::RichText::new(err).small().color(egui::Color32::from_rgb(230, 120, 80)));
+                    }
+                    for d in entries {
                         ui.horizontal(|ui| {
                             let item = ui.selectable_label(false, &d.label).on_hover_text(&d.hover);
                             if item.clicked() {
