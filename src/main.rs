@@ -2369,6 +2369,54 @@ fn format_duration(d: std::time::Duration) -> String {
     if h > 0 { format!("{}:{:02}:{:02}", h, m, s) } else { format!("{}:{:02}", m, s) }
 }
 
+/// Jednotka velikosti v panelech (Nastavení → Zobrazení velikosti):
+/// 0 = automaticky (B/KB/MB/GB podle velikosti), 1 = B, 2 = KB, 3 = MB,
+/// 4 = GB, 5 = TB. Globální, ať ji nemusí dostávat každá vykreslovací funkce.
+static SIZE_UNIT: AtomicU8 = AtomicU8::new(0);
+const SIZE_UNIT_NAMES: [&str; 6] = ["auto", "B", "KB", "MB", "GB", "TB"];
+const SIZE_UNIT_LABELS: [&str; 6] = [
+    "Automaticky (B / KB / MB / GB podle velikosti)",
+    "Vždy v bajtech (B)", "Vždy v KB", "Vždy v MB", "Vždy v GB", "Vždy v TB",
+];
+
+fn size_unit_from_str(v: &str) -> u8 {
+    SIZE_UNIT_NAMES.iter().position(|n| n.eq_ignore_ascii_case(v.trim())).unwrap_or(0) as u8
+}
+
+/// Celá část čísla s mezerami po tisících: 1234567 -> "1 234 567".
+fn group_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 { out.push(' '); }
+        out.push(c);
+    }
+    out
+}
+
+/// Velikost pro panely a stavový řádek - podle nastavené jednotky.
+fn format_size_panel(bytes: u64) -> String {
+    let unit = SIZE_UNIT.load(Ordering::Relaxed);
+    if unit == 0 || unit > 5 {
+        return format_size(bytes);
+    }
+    if unit == 1 {
+        return format!("{} B", group_thousands(bytes));
+    }
+    let div = 1024f64.powi(unit as i32 - 1);
+    let v = bytes as f64 / div;
+    let decimals = if unit == 2 { 1 } else { 2 };
+    let whole = v.trunc() as u64;
+    let frac = format!("{:.*}", decimals, v.fract());
+    // "0.45" -> ".45"; zaokrouhlení může dát "1.00" -> přičíst k celé části
+    let (whole, frac) = if frac.starts_with('1') {
+        (whole + 1, frac[1..].to_string())
+    } else {
+        (whole, frac[1..].to_string())
+    };
+    format!("{}{} {}", group_thousands(whole), frac, SIZE_UNIT_NAMES[unit as usize])
+}
+
 fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -3496,6 +3544,8 @@ struct FileManagerApp {
     rename_select_ext: bool,
     /// Kopírování/přesun: zachovat původní datum a čas (výchozí ano).
     preserve_times: bool,
+    /// Jednotka velikosti v panelech (viz SIZE_UNIT)
+    size_unit: u8,
     color_groups: Vec<ColorGroup>,
     /// Barva textu označených souborů (Nastavení → Vzhled)
     sel_color: [u8; 3],
@@ -3796,6 +3846,14 @@ impl Default for FileManagerApp {
                 .and_then(|c| c.lines()
                     .find_map(|l| l.strip_prefix("PRESERVE_TIMES=").map(|v| v.trim() != "false")))
                 .unwrap_or(true),
+            size_unit: {
+                let u = fs::read_to_string(state_file_path()).ok()
+                    .and_then(|c| c.lines()
+                        .find_map(|l| l.strip_prefix("SIZE_UNIT=").map(size_unit_from_str)))
+                    .unwrap_or(0);
+                SIZE_UNIT.store(u, Ordering::Relaxed);
+                u
+            },
             color_groups: color_groups_init.clone(),
             sel_color: fs::read_to_string(state_file_path()).ok()
                 .and_then(|c| c.lines()
@@ -4538,6 +4596,7 @@ impl FileManagerApp {
         content.push_str(&format!("EXT_EDITOR={}\n",  self.external_editor));
         content.push_str(&format!("RENAME_SELECT_EXT={}\n", self.rename_select_ext));
         content.push_str(&format!("PRESERVE_TIMES={}\n", self.preserve_times));
+        content.push_str(&format!("SIZE_UNIT={}\n", SIZE_UNIT_NAMES[(self.size_unit as usize).min(5)]));
         content.push_str(&format!("DIR_SORT={}\n", match self.dir_sort {
             DirSort::FirstByName => "FirstByName",
             DirSort::FirstByCol  => "FirstByCol",
@@ -4577,6 +4636,8 @@ impl FileManagerApp {
         self.external_editor = get("EXT_EDITOR=").unwrap_or_default();
         self.rename_select_ext = get("RENAME_SELECT_EXT=").map_or(false, |v| v == "true");
         self.preserve_times = get("PRESERVE_TIMES=").map_or(true, |v| v != "false");
+        self.size_unit = get("SIZE_UNIT=").map_or(0, |v| size_unit_from_str(&v));
+        SIZE_UNIT.store(self.size_unit, Ordering::Relaxed);
         self.dir_sort = match get("DIR_SORT=").as_deref() {
             Some("FirstByName") => DirSort::FirstByName,
             Some("Mixed")       => DirSort::Mixed,
@@ -5580,7 +5641,7 @@ impl eframe::App for FileManagerApp {
                         stat.push_str(&format!(", {} složek", sel_dirs));
                     }
                     if sel_size > 0 {
-                        stat.push_str(&format!("  ({})", format_size(sel_size)));
+                        stat.push_str(&format!("  ({})", format_size_panel(sel_size)));
                     }
                     ui.label(egui::RichText::new(stat)
                         .color(egui::Color32::from_rgb(255, 210, 80)));
@@ -5592,7 +5653,7 @@ impl eframe::App for FileManagerApp {
                         .filter(|e| !e.is_dir).map(|e| e.size).sum();
                     ui.label(egui::RichText::new(
                         format!("{} souborů, {} složek  ({})",
-                            total_files, total_dirs, format_size(total_size)))
+                            total_files, total_dirs, format_size_panel(total_size)))
                         .color(egui::Color32::GRAY));
                 }
 
@@ -6947,6 +7008,30 @@ impl FileManagerApp {
                         "Když je vypnuto, zkopírované soubory a složky dostanou aktuální datum a čas. Přesun v rámci jednoho disku datum zachová vždy.")
                         .small().color(egui::Color32::GRAY));
                     if self.preserve_times != was { changed = true; }
+                });
+
+                ui.add_space(8.0);
+
+                // Zobrazení velikosti souborů
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Zobrazení velikosti").strong());
+                    ui.separator();
+                    let was = self.size_unit;
+                    egui::ComboBox::from_id_source("size_unit_combo")
+                        .selected_text(SIZE_UNIT_LABELS[(self.size_unit as usize).min(5)])
+                        .width(320.0)
+                        .show_ui(ui, |ui| {
+                            for (i, label) in SIZE_UNIT_LABELS.iter().enumerate() {
+                                ui.selectable_value(&mut self.size_unit, i as u8, *label);
+                            }
+                        });
+                    ui.label(egui::RichText::new(
+                        "Platí pro sloupec Vel. v panelech a součty ve stavovém řádku. Pevná jednotka usnadní porovnání velikostí pod sebou.")
+                        .small().color(egui::Color32::GRAY));
+                    if self.size_unit != was {
+                        SIZE_UNIT.store(self.size_unit, Ordering::Relaxed);
+                        changed = true;
+                    }
                 });
 
                 ui.add_space(8.0);
@@ -9163,11 +9248,11 @@ fn render_panel(
                     };
                     let size_str = if entry.is_dir {
                         match entry.dir_size {
-                            Some(s) => format_size(s),
+                            Some(s) => format_size_panel(s),
                             None => String::new(),
                         }
                     } else {
-                        format_size(entry.size)
+                        format_size_panel(entry.size)
                     };
 
                     // Inline přejmenování – renderuje se přímo na místě tohoto
