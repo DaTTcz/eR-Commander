@@ -9016,15 +9016,33 @@ fn render_panel(
         // ── Záhlaví + seznam ────────────────────────────────────────────────
         ui.separator();
 
-        // Pevné šířky sloupců v px
+        // Šířky sloupců v px. Příp., Vel. a Datum se přizpůsobí obsahu
+        // (změřeným písmem řádků) - např. velikost "Vždy v bajtech" nebo
+        // dlouhá přípona by se do pevné šířky nevešla. Minimum = původní
+        // pevné šířky, takže při běžném obsahu se nic nemění.
         const ICO_W:  f32 = 20.0;
-        const EXT_W:  f32 = 52.0;
-        const SIZE_W: f32 = 72.0;
-        const DATE_W: f32 = 122.0;
         const ATTR_W: f32 = 24.0;
         const H:      f32 = 18.0;
+        let body_font = ui.style().text_styles[&egui::TextStyle::Body].clone();
+        let text_w = |t: &str| ui.fonts(|f|
+            f.layout_no_wrap(t.to_string(), body_font.clone(), egui::Color32::WHITE).size().x);
+        // Přípona: nejširší z položek (prvních 5000, ať obří složka nebrzdí)
+        let mut ext_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let widest_ext = panel.entries.iter().take(5000)
+            .filter(|e| !e.ext.is_empty() && ext_seen.insert(e.ext.as_str()))
+            .map(|e| text_w(&e.ext))
+            .fold(0.0_f32, f32::max);
+        let ext_w: f32 = (widest_ext + 12.0).clamp(52.0, 140.0);
+        // Velikost: stačí změřit text největší položky
+        let max_size = panel.entries.iter()
+            .map(|e| if e.is_dir { e.dir_size.unwrap_or(0) } else { e.size })
+            .max().unwrap_or(0);
+        let size_w: f32 = if SIZE_UNIT.load(Ordering::Relaxed) == 0 { 72.0 } else {
+            (text_w(&format_size_panel(max_size)) + 12.0).max(72.0)
+        };
+        let date_w: f32 = (text_w("00.00.0000 00:00") + 12.0).max(122.0);
         // Celková fixní suma + spacing (egui přidává ~4px mezi widgety)
-        let fixed = ICO_W + EXT_W + SIZE_W + DATE_W + ATTR_W + 30.0;
+        let fixed = ICO_W + ext_w + size_w + date_w + ATTR_W + 30.0;
         let name_w = (ui.available_width() - fixed).max(80.0);
 
         // Záhlaví sloupců
@@ -9044,9 +9062,9 @@ fn render_panel(
                 }};
             }
             hdr!("Název",    SortColumn::Name, name_w);
-            hdr!("Příp.",    SortColumn::Ext,  EXT_W);
-            hdr!("Vel.",     SortColumn::Size, SIZE_W);
-            hdr!("Datum",    SortColumn::Date, DATE_W);
+            hdr!("Příp.",    SortColumn::Ext,  ext_w);
+            hdr!("Vel.",     SortColumn::Size, size_w);
+            hdr!("Datum",    SortColumn::Date, date_w);
             hdr!("A",        SortColumn::Attr, ATTR_W);
         });
 
@@ -9191,12 +9209,12 @@ fn render_panel(
                             let tint = if ext_key.is_empty() { None } else { ext_colors.get(ext_key).copied() };
                             cell_left(ui,  name_w, $stem,           $sel, $cur, tint);
                             // přípona doleva
-                            cell_left(ui,  EXT_W,  $ext,            $sel, $cur, tint);
+                            cell_left(ui,  ext_w,  $ext,            $sel, $cur, tint);
                             // velikost doprava
                             let size_str: String = $size;
-                            cell_right(ui, SIZE_W, &size_str,       $sel, $cur);
+                            cell_right(ui, size_w, &size_str,       $sel, $cur);
                             // datum doleva
-                            cell_left(ui,  DATE_W, $date,           $sel, $cur, None);
+                            cell_left(ui,  date_w, $date,           $sel, $cur, None);
                             // atribut doleva
                             cell_left(ui,  ATTR_W, $attr,           $sel, $cur, None);
                         });
