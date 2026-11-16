@@ -11,8 +11,11 @@ name: Build
 #
 # - push tagu "v*" (např. v0.8.12) -> plný build + test na distribucích +
 #   GitHub Release. Release vznikne jen tehdy, když všechny testy projdou.
-#   Tag musí odpovídat verzi v Cargo.toml, jinak build skončí chybou
-#   (poučení z v0.8.9, kdy binárka hlásila starou verzi).
+#   VERZE SE BERE Z TAGU: tag v0.12.6 -> build si sám přepíše verzi
+#   v Cargo.toml i Cargo.lock na 0.12.6 (jen v CI, do repozitáře se nic
+#   necommituje). Verzi v Cargo.toml tedy není potřeba ručně měnit -
+#   binárka vždy hlásí verzi z tagu (poučení z v0.8.9, kdy hlásila starou).
+#   Tag musí mít tvar vX.Y.Z (např. v0.12.6), jinak build skončí chybou.
 #
 # Soubory v releasu:
 #   eR_Commander-x86_64-pc-windows-msvc.zip       Windows (+ samo-aktualizace)
@@ -69,7 +72,7 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --locked
 
-  # ── Verze z Cargo.toml (+ kontrola proti tagu) ──────────────────────────
+  # ── Verze: z tagu (vX.Y.Z), při ručním spuštění z Cargo.toml ──────────
   version:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -79,12 +82,17 @@ jobs:
       - uses: actions/checkout@v7
       - id: v
         run: |
-          VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
-          echo "Verze v Cargo.toml: $VERSION"
-          if [ -z "$VERSION" ]; then echo "::error::V Cargo.toml nebyla nalezena verze"; exit 1; fi
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} neodpovídá verzi v Cargo.toml (v${VERSION})"
-            exit 1
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "Verze z tagu ${GITHUB_REF_NAME}: $VERSION"
+            if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Tag ${GITHUB_REF_NAME} nemá tvar vX.Y.Z (např. v0.12.6)"
+              exit 1
+            fi
+          else
+            VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+            echo "Verze v Cargo.toml (ruční spuštění): $VERSION"
+            if [ -z "$VERSION" ]; then echo "::error::V Cargo.toml nebyla nalezena verze"; exit 1; fi
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -92,8 +100,18 @@ jobs:
   build-windows:
     needs: version
     runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      - name: Verze do Cargo.toml / Cargo.lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '0,/^version = ".*"/s//version = "'"$VERSION"'"/' Cargo.toml
+          sed -i '/^name = "er-commander"$/{n;s/^version = ".*"/version = "'"$VERSION"'"/}' Cargo.lock
+          grep -m1 '^version' Cargo.toml
+          grep -A1 '^name = "er-commander"$' Cargo.lock
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -136,6 +154,13 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev \
             libgtk-4-dev
       - uses: actions/checkout@v7
+      - name: Verze do Cargo.toml / Cargo.lock
+        run: |
+          set -eu
+          sed -i '0,/^version = ".*"/s//version = "'"$VERSION"'"/' Cargo.toml
+          sed -i '/^name = "er-commander"$/{n;s/^version = ".*"/version = "'"$VERSION"'"/}' Cargo.lock
+          grep -m1 '^version' Cargo.toml
+          grep -A1 '^name = "er-commander"$' Cargo.lock
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build (eR Commander + pomocník er-drag)
