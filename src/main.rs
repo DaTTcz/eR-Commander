@@ -476,7 +476,9 @@ impl Panel {
             if loc.internal_dir.is_empty() {
                 // Jsme v kořeni archivu - vrátíme se do reálné složky
                 // a nastavíme kurzor na ZIP soubor
-                let zip_name = self.current_path.file_name()
+                // (current_path je při procházení archivu složka, ve které
+                // ZIP leží - jméno je proto potřeba vzít z cesty archivu.)
+                let zip_name = loc.archive_path.file_name()
                     .unwrap_or_default().to_string_lossy().to_string();
                 self.archive_location = None;
                 self.refresh();
