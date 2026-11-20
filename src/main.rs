@@ -198,6 +198,39 @@ struct Panel {
     archive_location: Option<ArchiveLocation>,
     net_location: Option<NetLocation>,
     error: Option<String>,
+    /// Filtr zobrazených položek (Ctrl+S nebo ikonka 🔍): část jména, nebo
+    /// maska s * a ? (víc masek oddělit ";"). Prázdný = bez filtru.
+    filter: String,
+    /// Je řádek s filtrem otevřený?
+    filter_open: bool,
+    /// Jednorázově dát fokus do pole filtru (po Ctrl+S / kliknutí na ikonku).
+    filter_focus_req: bool,
+}
+
+/// Nastavení → "Filtr: ponechat zobrazené složky" (globální jako SIZE_UNIT).
+static FILTER_KEEP_DIRS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Odpovídá jméno filtru? Bez * a ? = obsahuje text (bez ohledu na velikost
+/// písmen), jinak maska (*.mkv; *.mp4). Víc výrazů oddělených ";" = stačí jeden.
+fn filter_matches(name: &str, filter: &str) -> bool {
+    let name_l = name.to_lowercase();
+    filter.split(';').map(str::trim).filter(|f| !f.is_empty()).any(|f| {
+        let f = f.to_lowercase();
+        if f.contains('*') || f.contains('?') {
+            let mut re = String::from("^");
+            for c in f.chars() {
+                match c {
+                    '*' => re.push_str(".*"),
+                    '?' => re.push('.'),
+                    c => re.push_str(&regex::escape(&c.to_string())),
+                }
+            }
+            re.push('$');
+            regex::Regex::new(&re).map_or(false, |r| r.is_match(&name_l))
+        } else {
+            name_l.contains(&f)
+        }
+    })
 }
 
 impl Panel {
@@ -225,6 +258,9 @@ impl Panel {
             archive_location: None,
             net_location: None,
             error: None,
+            filter: String::new(),
+            filter_open: false,
+            filter_focus_req: false,
         };
         panel.refresh();
         panel
@@ -339,6 +375,13 @@ impl Panel {
             let p = self.current_path.to_string_lossy().into_owned();
             // Na Windows root disk C: -> C:\ (bez toho se nevejdeme zpět)
             self.path_input = if p.ends_with(':') { format!("{}\\", p) } else { p };
+        }
+
+        // Filtr zobrazených položek
+        if !self.filter.trim().is_empty() {
+            let keep_dirs = FILTER_KEEP_DIRS.load(Ordering::Relaxed);
+            let filter = self.filter.clone();
+            self.entries.retain(|e| (keep_dirs && e.is_dir) || filter_matches(&e.name, &filter));
         }
 
         // Kurzor musí zůstat v platném rozsahu i po smazání/přesunu/navigaci
@@ -2143,13 +2186,31 @@ fn spawn_zip_extract(
             Ok(a) => a,
             Err(e) => { let _ = tx.send(OpMsg::Error(e.to_string())); return; }
         };
-        let total = archive.len();
-        let bytes_total: u64 = (0..total).filter_map(|i| {
-            archive.by_index(i).ok().map(|e| e.size())
-        }).sum();
+        // Celkový počet a velikost jen z VYBRANÝCH položek (rozbalená
+        // velikost souborů, bez složek). Dřív se počítal celý archiv, takže
+        // při rozbalení části archivu nesouhlasil počet ani MB.
+        let matches = |name: &str| -> bool {
+            let name = name.replace('\\', "/");
+            let Some(rest) = name.strip_prefix(internal_dir.as_str()) else { return false };
+            !rest.is_empty() && selected_names.iter().any(|sel| {
+                rest == sel.as_str() || rest.starts_with(&format!("{}/", sel))
+            })
+        };
+        let mut total = 0usize;
+        let mut bytes_total: u64 = 0;
+        for i in 0..archive.len() {
+            if let Ok(e) = archive.by_index(i) {
+                if !e.is_dir() && matches(e.name()) {
+                    total += 1;
+                    bytes_total += e.size();
+                }
+            }
+        }
+        let _ = tx.send(OpMsg::Progress { done: 0, total, bytes_done: 0, bytes_total });
         let mut bytes_done: u64 = 0;
+        let mut done: usize = 0;
 
-        for i in 0..total {
+        for i in 0..archive.len() {
             if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
             while flag_thread.load(Ordering::Relaxed) == OP_PAUSE {
                 thread::sleep(std::time::Duration::from_millis(100));
@@ -2183,7 +2244,10 @@ fn spawn_zip_extract(
                 continue;
             }
             if !overwrite && out_path.exists() {
+                done += 1;
+                bytes_done += entry.size();
                 let _ = tx.send(OpMsg::Skipped(()));
+                let _ = tx.send(OpMsg::Progress { done, total, bytes_done, bytes_total });
                 continue;
             }
             if let Some(parent) = out_path.parent() {
@@ -2192,11 +2256,29 @@ fn spawn_zip_extract(
 
             let entry_size = entry.size();
             let file_name = rest.to_string();
+            let _ = tx.send(OpMsg::SlotStart { thread_id: 0, file: out_rel.clone(), file_size: entry_size });
 
-            // Pokus o zápis - při chybě zobrazíme dialog
+            // Pokus o zápis po kusech (průběh i u velkých souborů) - při
+            // chybě zobrazíme dialog
+            let mut written: u64 = 0;
             let write_result = (|| -> std::io::Result<()> {
+                use std::io::{Read, Write};
                 let mut out_file = File::create(&out_path)?;
-                std::io::copy(&mut entry, &mut out_file)?;
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    if flag_thread.load(Ordering::Relaxed) == OP_STOP { break; }
+                    while flag_thread.load(Ordering::Relaxed) == OP_PAUSE {
+                        thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    let n = entry.read(&mut buf)?;
+                    if n == 0 { break; }
+                    out_file.write_all(&buf[..n])?;
+                    written += n as u64;
+                    let _ = tx.send(OpMsg::SlotProgress { thread_id: 0, bytes_copied: n as u64 });
+                    let _ = tx.send(OpMsg::Progress {
+                        done, total, bytes_done: bytes_done + written, bytes_total,
+                    });
+                }
                 Ok(())
             })();
 
@@ -2219,16 +2301,16 @@ fn spawn_zip_extract(
                         _ => {}
                     }
                 }
+                done += 1;
+                bytes_done += entry_size;
+                let _ = tx.send(OpMsg::SlotClear { thread_id: 0 });
                 continue; // přeskočíme chybný soubor
             }
 
+            done += 1;
             bytes_done += entry_size;
-            let _ = tx.send(OpMsg::Progress {
-                done: i + 1,
-                total,
-                bytes_done,
-                bytes_total,
-            });
+            let _ = tx.send(OpMsg::SlotDone { thread_id: 0 });
+            let _ = tx.send(OpMsg::Progress { done, total, bytes_done, bytes_total });
         }
 
         let _ = tx.send(OpMsg::Finished);
@@ -3546,6 +3628,8 @@ struct FileManagerApp {
     preserve_times: bool,
     /// Jednotka velikosti v panelech (viz SIZE_UNIT)
     size_unit: u8,
+    /// Filtr: ponechat zobrazené složky (viz FILTER_KEEP_DIRS)
+    filter_keep_dirs: bool,
     color_groups: Vec<ColorGroup>,
     /// Barva textu označených souborů (Nastavení → Vzhled)
     sel_color: [u8; 3],
@@ -3846,6 +3930,14 @@ impl Default for FileManagerApp {
                 .and_then(|c| c.lines()
                     .find_map(|l| l.strip_prefix("PRESERVE_TIMES=").map(|v| v.trim() != "false")))
                 .unwrap_or(true),
+            filter_keep_dirs: {
+                let v = fs::read_to_string(state_file_path()).ok()
+                    .and_then(|c| c.lines()
+                        .find_map(|l| l.strip_prefix("FILTER_KEEP_DIRS=").map(|v| v.trim() != "false")))
+                    .unwrap_or(true);
+                FILTER_KEEP_DIRS.store(v, Ordering::Relaxed);
+                v
+            },
             size_unit: {
                 let u = fs::read_to_string(state_file_path()).ok()
                     .and_then(|c| c.lines()
@@ -4596,6 +4688,7 @@ impl FileManagerApp {
         content.push_str(&format!("EXT_EDITOR={}\n",  self.external_editor));
         content.push_str(&format!("RENAME_SELECT_EXT={}\n", self.rename_select_ext));
         content.push_str(&format!("PRESERVE_TIMES={}\n", self.preserve_times));
+        content.push_str(&format!("FILTER_KEEP_DIRS={}\n", self.filter_keep_dirs));
         content.push_str(&format!("SIZE_UNIT={}\n", SIZE_UNIT_NAMES[(self.size_unit as usize).min(5)]));
         content.push_str(&format!("DIR_SORT={}\n", match self.dir_sort {
             DirSort::FirstByName => "FirstByName",
@@ -4638,6 +4731,8 @@ impl FileManagerApp {
         self.preserve_times = get("PRESERVE_TIMES=").map_or(true, |v| v != "false");
         self.size_unit = get("SIZE_UNIT=").map_or(0, |v| size_unit_from_str(&v));
         SIZE_UNIT.store(self.size_unit, Ordering::Relaxed);
+        self.filter_keep_dirs = get("FILTER_KEEP_DIRS=").map_or(true, |v| v != "false");
+        FILTER_KEEP_DIRS.store(self.filter_keep_dirs, Ordering::Relaxed);
         self.dir_sort = match get("DIR_SORT=").as_deref() {
             Some("FirstByName") => DirSort::FirstByName,
             Some("Mixed")       => DirSort::Mixed,
@@ -5879,8 +5974,12 @@ impl FileManagerApp {
             // první stisk klávesy po kliknutí na adresní řádku se ztratí.
             let left_id  = egui::Id::new(("path_input", ActivePanel::Left));
             let right_id = egui::Id::new(("path_input", ActivePanel::Right));
+            // Pole filtru se chová stejně (šipky apod. patří do něj)
+            let lf_id = egui::Id::new(("filter_input", ActivePanel::Left));
+            let rf_id = egui::Id::new(("filter_input", ActivePanel::Right));
             ctx.memory(|m| {
-                m.focused().map(|f| f == left_id || f == right_id).unwrap_or(false)
+                m.focused().map(|f| f == left_id || f == right_id || f == lf_id || f == rf_id)
+                    .unwrap_or(false)
             })
         };
 
@@ -6114,6 +6213,9 @@ impl FileManagerApp {
         let ctrl_a = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::A));
         let alt_c  = ctx.input(|i| i.modifiers.alt && !i.modifiers.ctrl && i.key_pressed(egui::Key::C));
         let ctrl_h = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H));
+        // Ctrl+S = filtr zobrazených souborů (jako rychlý filtr v Total Commanderu)
+        let ctrl_s = ctx.input(|i| i.modifiers.command && !i.modifiers.shift && !i.modifiers.alt
+            && i.key_pressed(egui::Key::S));
         // Ctrl+← / Ctrl+→ = levý / pravý panel dostane složku druhého panelu
         // (jako Total Commander), Ctrl+U = prohodit složky obou panelů.
         let (ctrl_left, ctrl_right, ctrl_u) = ctx.input(|i| {
@@ -6193,6 +6295,11 @@ impl FileManagerApp {
             if f4     { self.open_external_editor(); }
             if alt_f5 { self.start_zip_pack(); }
             if ctrl_h { self.open_hash_dialog(); }
+            if ctrl_s {
+                let panel = self.active_panel_mut();
+                panel.filter_open = true;
+                panel.filter_focus_req = true;
+            }
             if ctrl_left  { self.copy_location(ActivePanel::Right, ActivePanel::Left); }
             if ctrl_right { self.copy_location(ActivePanel::Left, ActivePanel::Right); }
             if ctrl_u     { self.swap_locations(); }
@@ -7030,6 +7137,25 @@ impl FileManagerApp {
                         .small().color(egui::Color32::GRAY));
                     if self.size_unit != was {
                         SIZE_UNIT.store(self.size_unit, Ordering::Relaxed);
+                        changed = true;
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Filtr zobrazených souborů
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Filtr souborů (Ctrl+S / 🔍)").strong());
+                    ui.separator();
+                    let was = self.filter_keep_dirs;
+                    ui.checkbox(&mut self.filter_keep_dirs, "Při filtrování ponechat zobrazené složky");
+                    ui.label(egui::RichText::new(
+                        "Zapnuto: filtr skryje jen soubory, složky zůstanou vidět a dá se do nich vlézt. Vypnuto: filtr platí i pro složky.")
+                        .small().color(egui::Color32::GRAY));
+                    if self.filter_keep_dirs != was {
+                        FILTER_KEEP_DIRS.store(self.filter_keep_dirs, Ordering::Relaxed);
+                        self.left.refresh();
+                        self.right.refresh();
                         changed = true;
                     }
                 });
@@ -8828,7 +8954,7 @@ fn render_panel(
                         });
                     }
                 });
-            let star_w = 28.0;
+            let star_w = 60.0;
             let bar_w  = (ui.available_width() - star_w).max(20.0);
             if let Some((free, total)) = panel.disk_space_cached(ui.ctx()) {
                 if total > 0 {
@@ -8843,6 +8969,18 @@ fn render_panel(
             } else { ui.add_space(bar_w); }
             if ui.button(Icons::bookmark()).clicked() {
                 panel_action = Some(PanelUiAction::OpenBookmarks);
+            }
+            let filter_active = !panel.filter.trim().is_empty();
+            let fbtn = egui::Button::new("🔍").selected(panel.filter_open || filter_active);
+            if ui.add(fbtn).on_hover_text("Filtr zobrazených souborů (Ctrl+S)").clicked() {
+                *active = which;
+                if panel.filter_open {
+                    panel.filter_open = false;
+                    if filter_active { panel.filter.clear(); panel.refresh(); }
+                } else {
+                    panel.filter_open = true;
+                    panel.filter_focus_req = true;
+                }
             }
         });
 
@@ -9011,6 +9149,52 @@ fn render_panel(
         }
         if let Some(e) = &panel.error {
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
+        }
+
+        // ── Filtr zobrazených souborů (Ctrl+S / 🔍) ─────────────────────────
+        if panel.filter_open {
+            let filter_id = egui::Id::new(("filter_input", which));
+            let mut refilter = false;
+            let mut close = false;
+            ui.horizontal(|ui| {
+                ui.label("🔍");
+                let resp = ui.add(egui::TextEdit::singleline(&mut panel.filter)
+                    .id(filter_id)
+                    .hint_text("část jména nebo maska, např. *.mkv; *.mp4")
+                    .desired_width((ui.available_width() - 30.0).max(60.0)));
+                if panel.filter_focus_req {
+                    resp.request_focus();
+                    panel.filter_focus_req = false;
+                }
+                if resp.changed() { refilter = true; }
+                if resp.has_focus() {
+                    *active = which;
+                }
+                // Esc v poli = zrušit filtr a zavřít; Enter = zpět do seznamu
+                // (egui při Esc pole samo opustí, proto i lost_focus)
+                if (resp.has_focus() || resp.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    close = true;
+                }
+                if ui.small_button("✖").on_hover_text("Zrušit filtr").clicked() {
+                    close = true;
+                }
+            });
+            if close {
+                panel.filter_open = false;
+                if !panel.filter.is_empty() {
+                    panel.filter.clear();
+                    refilter = true;
+                }
+            }
+            if refilter {
+                panel.cursor = 0;
+                panel.refresh();
+            }
+        } else if !panel.filter.trim().is_empty() {
+            panel.filter.clear();
+            panel.refresh();
         }
 
         // ── Záhlaví + seznam ────────────────────────────────────────────────
