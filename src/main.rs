@@ -211,7 +211,9 @@ struct Panel {
 static FILTER_KEEP_DIRS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Odpovídá jméno filtru? Bez * a ? = obsahuje text (bez ohledu na velikost
-/// písmen), jinak maska (*.mkv; *.mp4). Víc výrazů oddělených ";" = stačí jeden.
+/// písmen), jinak maska od začátku jména (*.mkv; *.mp4) - konec masky je
+/// otevřený, ať filtr zužuje výsledky průběžně při psaní. Víc výrazů
+/// oddělených ";" = stačí jeden.
 fn filter_matches(name: &str, filter: &str) -> bool {
     let name_l = name.to_lowercase();
     filter.split(';').map(str::trim).filter(|f| !f.is_empty()).any(|f| {
@@ -225,7 +227,8 @@ fn filter_matches(name: &str, filter: &str) -> bool {
                     c => re.push_str(&regex::escape(&c.to_string())),
                 }
             }
-            re.push('$');
+            // Bez "$" na konci: maska platí i pro začátek přípony, takže se
+            // výsledky ukazují už během psaní (*.s najde i .stl, .sh...).
             regex::Regex::new(&re).map_or(false, |r| r.is_match(&name_l))
         } else {
             name_l.contains(&f)
@@ -5581,6 +5584,8 @@ impl eframe::App for FileManagerApp {
                 ctx.memory_mut(|m| {
                     m.surrender_focus(egui::Id::new(("path_input", ActivePanel::Left)));
                     m.surrender_focus(egui::Id::new(("path_input", ActivePanel::Right)));
+                    m.surrender_focus(egui::Id::new(("filter_input", ActivePanel::Left)));
+                    m.surrender_focus(egui::Id::new(("filter_input", ActivePanel::Right)));
                 });
             }
         }
@@ -5618,7 +5623,13 @@ impl eframe::App for FileManagerApp {
                 if let Some(focused) = m.focused() {
                     let left_path  = egui::Id::new(("path_input", ActivePanel::Left));
                     let right_path = egui::Id::new(("path_input", ActivePanel::Right));
-                    if focused != left_path && focused != right_path {
+                    // Pole filtru (Ctrl+S) je textové pole jako adresní řádek -
+                    // fokus mu nebrat, jinak do něj nejde psát.
+                    let left_filter  = egui::Id::new(("filter_input", ActivePanel::Left));
+                    let right_filter = egui::Id::new(("filter_input", ActivePanel::Right));
+                    if focused != left_path && focused != right_path
+                        && focused != left_filter && focused != right_filter
+                    {
                         m.surrender_focus(focused);
                     }
                 }
